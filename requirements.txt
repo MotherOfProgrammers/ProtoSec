@@ -1,2 +1,6 @@
 PyQt6>=6.6,<7
 cryptography>=42,<47
+packaging>=23.2,<27
+mcp>=1.6,<2
+regex>=2024.5,<2027
+tomli>=2,<3; python_version < "3.11"

@@ -2,6 +2,7 @@
 
 #include "../include/mmap_file.hpp"
 #include "../include/rules.hpp"
+#include "../include/tree_sitter_comments.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -22,13 +23,13 @@ namespace {
 
 const std::unordered_set<std::string> kSkippedDirectories = {
     ".git", ".idea", ".mypy_cache", ".next", ".pytest_cache", ".venv",
-    ".vscode", "__pycache__", "build", "coverage", "dist", "node_modules",
-    "target", "vendor", "venv",
+    ".vscode", "__pycache__", "__tests__", "build", "coverage", "dist",
+    "node_modules", "spec", "specs", "target", "test", "tests", "vendor", "venv",
 };
 
 const std::unordered_set<std::string> kAllowedExtensions = {
-    ".c", ".cjs", ".cpp", ".cs", ".css", ".go", ".h", ".hpp", ".html",
-    ".java", ".js", ".jsx", ".json", ".kt", ".mjs", ".php", ".py", ".rb",
+    ".c", ".cjs", ".cpp", ".cs", ".css", ".cts", ".go", ".h", ".hpp", ".html",
+    ".java", ".js", ".jsx", ".json", ".kt", ".mjs", ".mts", ".php", ".py", ".rb",
     ".rules", ".rs", ".sh", ".sql", ".swift", ".toml", ".ts", ".tsx", ".vue",
     ".yaml", ".yml",
 };
@@ -205,6 +206,12 @@ FileResult analyzeFile(const fs::path& file_path, const fs::path& root_path) {
     const auto relative_path = toGenericRelativePath(file_path, root_path);
     const auto extension = lower(file_path.extension().string());
     const auto filename = lower(file_path.filename().string());
+    std::string masked_content;
+    std::string_view analysis_content = content;
+    if (const auto language = sourceLanguageForPath(file_path)) {
+        masked_content = maskComments(content, findCommentByteRanges(content, *language));
+        analysis_content = masked_content;
+    }
 
     if (filename.starts_with(".env") && !kEnvTemplates.contains(filename)) {
         addFinding(
@@ -216,10 +223,10 @@ FileResult analyzeFile(const fs::path& file_path, const fs::path& root_path) {
 
     const auto& rules = securityRules();
     std::size_t offset = 0;
-    while (offset < content.size()) {
-        const auto line_end = content.find('\n', offset);
-        const auto end = line_end == std::string_view::npos ? content.size() : line_end;
-        auto line = content.substr(offset, end - offset);
+    while (offset < analysis_content.size()) {
+        const auto line_end = analysis_content.find('\n', offset);
+        const auto end = line_end == std::string_view::npos ? analysis_content.size() : line_end;
+        auto line = analysis_content.substr(offset, end - offset);
         if (!line.empty() && line.back() == '\r') {
             line.remove_suffix(1);
         }
@@ -289,19 +296,19 @@ FileResult analyzeFile(const fs::path& file_path, const fs::path& root_path) {
 
     if (extension == ".sql") {
         std::match_results<std::string_view::const_iterator> table_match;
-        auto search_start = content.begin();
-        while (std::regex_search(search_start, content.end(), table_match, kCreateTable)) {
+        auto search_start = analysis_content.begin();
+        while (std::regex_search(search_start, analysis_content.end(), table_match, kCreateTable)) {
             const auto table_offset = static_cast<std::size_t>(
-                std::distance(content.begin(), table_match[0].first)
+                std::distance(analysis_content.begin(), table_match[0].first)
             );
             std::string table(table_match[1].first, table_match[1].second);
             table.erase(std::remove(table.begin(), table.end(), '"'), table.end());
             const auto separator = table.rfind('.');
             const auto table_name = separator == std::string::npos ? table : table.substr(separator + 1);
             bool rls_enabled = false;
-            auto alter_start = content.begin();
+            auto alter_start = analysis_content.begin();
             std::match_results<std::string_view::const_iterator> alter_match;
-            while (std::regex_search(alter_start, content.end(), alter_match, kAlterTableRls)) {
+            while (std::regex_search(alter_start, analysis_content.end(), alter_match, kAlterTableRls)) {
                 const std::string statement(alter_match[0].first, alter_match[0].second);
                 const auto normalized_statement = lower(statement);
                 if (normalized_statement.find(lower(table_name)) != std::string::npos &&
@@ -323,12 +330,14 @@ FileResult analyzeFile(const fs::path& file_path, const fs::path& root_path) {
         }
     }
 
-    if (extension == ".ts" || extension == ".tsx" || extension == ".js" || extension == ".jsx") {
+    if (extension == ".ts" || extension == ".tsx" || extension == ".mts" ||
+        extension == ".cts" || extension == ".js" || extension == ".jsx" ||
+        extension == ".mjs" || extension == ".cjs") {
         const auto generic_path = "/" + relative_path;
         std::match_results<std::string_view::const_iterator> mutation_match;
         if (generic_path.find("/app/api/") != std::string::npos &&
-            std::regex_search(content.begin(), content.end(), mutation_match, kNextMutation) &&
-            !std::regex_search(content.begin(), content.end(), kNextAuth)) {
+            std::regex_search(analysis_content.begin(), analysis_content.end(), mutation_match, kNextMutation) &&
+            !std::regex_search(analysis_content.begin(), analysis_content.end(), kNextAuth)) {
             const auto start = static_cast<std::size_t>(mutation_match.position());
             addFinding(
                 result.findings, "API-001", "API Security", "HIGH",
@@ -342,8 +351,8 @@ FileResult analyzeFile(const fs::path& file_path, const fs::path& root_path) {
 
     if (extension == ".py") {
         std::match_results<std::string_view::const_iterator> mutation_match;
-        if (std::regex_search(content.begin(), content.end(), mutation_match, kFastApiMutation) &&
-            !std::regex_search(content.begin(), content.end(), kFastApiAuth)) {
+        if (std::regex_search(analysis_content.begin(), analysis_content.end(), mutation_match, kFastApiMutation) &&
+            !std::regex_search(analysis_content.begin(), analysis_content.end(), kFastApiAuth)) {
             const auto start = static_cast<std::size_t>(mutation_match.position());
             addFinding(
                 result.findings, "API-003", "API Security", "MEDIUM",
@@ -356,20 +365,20 @@ FileResult analyzeFile(const fs::path& file_path, const fs::path& root_path) {
     }
 
     std::match_results<std::string_view::const_iterator> cookie_match;
-    if (std::regex_search(content.begin(), content.end(), cookie_match, kSetCookie) &&
-        !std::regex_search(content.begin(), content.end(), kHttpOnly)) {
+    if (std::regex_search(analysis_content.begin(), analysis_content.end(), cookie_match, kSetCookie) &&
+        !std::regex_search(analysis_content.begin(), analysis_content.end(), kHttpOnly)) {
         const auto start = static_cast<std::size_t>(cookie_match.position());
-        const auto line = lineAt(content, start);
-        const auto line_start = content.rfind('\n', start) == std::string_view::npos
+        const auto line = lineAt(analysis_content, start);
+        const auto line_start = analysis_content.rfind('\n', start) == std::string_view::npos
         ? 0
-        : content.rfind('\n', start) + 1;
-        const auto line_end = content.find('\n', line_start);
+        : analysis_content.rfind('\n', start) + 1;
+        const auto line_end = analysis_content.find('\n', line_start);
         addFinding(
             result.findings, "AUTH-001", "Session Security", "MEDIUM",
             "Cookie may be missing HttpOnly", relative_path, line,
-        makeSnippet(content.substr(
+        makeSnippet(analysis_content.substr(
             line_start,
-            line_end == std::string_view::npos ? content.size() - line_start : line_end - line_start
+            line_end == std::string_view::npos ? analysis_content.size() - line_start : line_end - line_start
         )),
             "Set HttpOnly, Secure, and an appropriate SameSite policy on session cookies."
         );
@@ -399,8 +408,10 @@ ScanReport Scanner::run(const ProgressCallback& progress) const {
              scanner_root / "core" / "include" / "mmap_file.hpp",
              scanner_root / "core" / "include" / "rules.hpp",
              scanner_root / "core" / "include" / "scanner.hpp",
+             scanner_root / "core" / "include" / "tree_sitter_comments.hpp",
              scanner_root / "core" / "src" / "main.cpp",
              scanner_root / "core" / "src" / "scanner.cpp",
+             scanner_root / "core" / "src" / "tree_sitter_comments.cpp",
          }) {
         scanner_sources.insert(fs::weakly_canonical(path));
     }
@@ -410,7 +421,7 @@ ScanReport Scanner::run(const ProgressCallback& progress) const {
          ++iterator) {
         const auto path = iterator->path();
         if (iterator->is_directory()) {
-            if (kSkippedDirectories.contains(path.filename().string())) {
+            if (kSkippedDirectories.contains(lower(path.filename().string()))) {
                 iterator.disable_recursion_pending();
             }
             continue;
@@ -427,7 +438,7 @@ ScanReport Scanner::run(const ProgressCallback& progress) const {
 
         const auto canonical_path = fs::weakly_canonical(path);
         if (scanner_sources.contains(canonical_path) ||
-            kSkippedDirectories.contains(path.parent_path().filename().string())) {
+            kSkippedDirectories.contains(lower(path.parent_path().filename().string()))) {
             continue;
         }
         files.push_back(path);

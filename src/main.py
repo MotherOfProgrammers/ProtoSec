@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 
 from src.scanner_rules import ALLOWED_EXTENSIONS, SKIP_DIRS, analyze_file
+from utils.custom_rules import scan_custom_rules
+from utils.cve_audit import merge_findings
 
 try:
     from pydantic import BaseModel, ConfigDict
@@ -112,7 +114,7 @@ def scan_repository(root_path: Path | str, progress_callback=None) -> dict:
         "elapsed_ms": round(elapsed_ms, 2),
         "summary": summary,
     }
-    return report
+    return merge_findings(report, scan_custom_rules(root))
 
 
 def scanner_binary_path() -> Path:
@@ -187,8 +189,20 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="ProtoSec scanner")
     parser.add_argument("--version", action="version", version="ProtoSec v1.0.0")
     parser.add_argument("repo_path", nargs="?", default=".")
-    parser.add_argument("--serve", action="store_true", help="Run the FastAPI app if FastAPI is installed")
+    server_options = parser.add_mutually_exclusive_group()
+    server_options.add_argument(
+        "--serve", action="store_true", help="Run the FastAPI app if FastAPI is installed"
+    )
+    server_options.add_argument(
+        "--mcp", action="store_true", help="Run the local MCP server over stdio"
+    )
     args = parser.parse_args(argv)
+
+    if args.mcp:
+        from src.mcp_server import main as run_mcp_server
+
+        run_mcp_server()
+        return 0
 
     if args.serve:
         app = create_app()

@@ -48,6 +48,10 @@ def main() -> int:
         str(ROOT / "dist"),
         "--add-binary",
         f"{scanner_path}{os.pathsep}.",
+        "--add-data",
+        f"{ROOT / 'assets'}{os.pathsep}assets",
+        "--add-data",
+        f"{ROOT / 'licenses'}{os.pathsep}licenses",
         "--paths",
         str(ROOT),
     ]
@@ -64,6 +68,9 @@ def main() -> int:
 
     pyinstaller.append(str(ROOT / "src" / "gui.py"))
     run(pyinstaller)
+    distribution_dir = ROOT / "dist"
+    shutil.copytree(ROOT / "assets", distribution_dir / "assets", dirs_exist_ok=True)
+    shutil.copytree(ROOT / "licenses", distribution_dir / "licenses", dirs_exist_ok=True)
     print(f"ProtoSec v1.0.0 packaged at {ROOT / 'dist' / ('ProtoSec.exe' if IS_WINDOWS else 'ProtoSec')}")
     return 0
 

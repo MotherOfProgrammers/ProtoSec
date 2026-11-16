@@ -10,13 +10,16 @@
 #endif
 
 int main(int argc, char* argv[]) {
-    if (argc != 2) {
-        std::cerr << "Usage: scanner_core <project_directory>\n";
+    const bool staged_only = argc == 3 && std::string(argv[1]) == "--staged-only";
+    const bool project_directory = argc == 2 && std::string(argv[1]) != "--staged-only";
+    if (!project_directory && !staged_only) {
+        std::cerr << "Usage: scanner_core <project_directory>\n"
+                     "       scanner_core --staged-only <snapshot_directory>\n";
         return 2;
     }
 
     try {
-        const std::filesystem::path target = argv[1];
+        const std::filesystem::path target = staged_only ? argv[2] : argv[1];
         const std::filesystem::path source_root = PROTOSEC_SOURCE_DIR;
         Scanner scanner(target, source_root);
         const auto report = scanner.run([](
@@ -30,7 +33,7 @@ int main(int argc, char* argv[]) {
             }
         });
         std::cout << serializeReport(report) << '\n';
-        return 0;
+        return staged_only && !report.findings.empty() ? 1 : 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

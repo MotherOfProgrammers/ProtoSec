@@ -132,7 +132,9 @@ void addFinding(
     const std::string& path,
     std::size_t line,
     std::string snippet,
-    const std::string& fix
+    const std::string& fix,
+    std::vector<std::size_t> data_flow_lines = {},
+    std::string cwe_id = {}
 ) {
     findings.push_back({
         id,
@@ -143,6 +145,8 @@ void addFinding(
         line,
         std::move(snippet),
         formatFix(fix, path, line),
+        std::move(data_flow_lines),
+        std::move(cwe_id),
     });
 }
 
@@ -181,8 +185,21 @@ std::string serializeFinding(const Finding& finding) {
            << "\"file_path\":" << serializeString(finding.file_path) << ','
            << "\"line_number\":" << finding.line_number << ','
            << "\"snippet\":" << serializeString(finding.snippet) << ','
-           << "\"fix_prompt\":" << serializeString(finding.fix_prompt)
-           << '}';
+           << "\"fix_prompt\":" << serializeString(finding.fix_prompt);
+    if (!finding.data_flow_lines.empty()) {
+        output << ",\"data_flow_lines\":[";
+        for (std::size_t index = 0; index < finding.data_flow_lines.size(); ++index) {
+            if (index != 0) {
+                output << ',';
+            }
+            output << finding.data_flow_lines[index];
+        }
+        output << ']';
+    }
+    if (!finding.cwe_id.empty()) {
+        output << ",\"cwe_id\":" << serializeString(finding.cwe_id);
+    }
+    output << '}';
     return output.str();
 }
 
@@ -233,6 +250,14 @@ FileResult analyzeFile(
     }
 
     for (const auto& flow : taint_flows) {
+        std::vector<std::size_t> flow_lines;
+        flow_lines.reserve(flow.path_start_bytes.size());
+        for (const auto offset : flow.path_start_bytes) {
+            const auto line = lineAt(content, offset);
+            if (flow_lines.empty() || flow_lines.back() != line) {
+                flow_lines.push_back(line);
+            }
+        }
         addFinding(
             result.findings,
             "DATA-001",
@@ -246,7 +271,9 @@ FileResult analyzeFile(
             flow.sink + "(...)",
             flow.dynamic_code
                 ? "Avoid eval/exec with untrusted input; replace it with fixed, validated operations."
-                : "Use parameterized SQL queries instead of concatenating untrusted input."
+                : "Use parameterized SQL queries instead of concatenating untrusted input.",
+            std::move(flow_lines),
+            flow.dynamic_code ? "CWE-94" : "CWE-89"
         );
     }
 

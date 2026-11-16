@@ -1,5 +1,6 @@
 #include "../../core/include/scanner.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -126,19 +127,115 @@ int main(int argc, char* argv[]) {
         "def dynamic(request):\n"
         "    eval(request.args.get('code'))\n"
     );
+    writeFile(
+        workspace / "interprocedural.py",
+        "def execute_query(cursor, query):\n"
+        "    cursor.execute(query)\n"
+        "def build_sql(value):\n"
+        "    prefix = 'SELECT * FROM accounts WHERE id='\n"
+        "    if value:\n"
+        "        query = prefix + value\n"
+        "    else:\n"
+        "        query = prefix + '1'\n"
+        "    return query\n"
+        "def handler(request, cursor):\n"
+        "    raw = request.args.get('id')\n"
+        "    sql = build_sql(raw)\n"
+        "    execute_query(cursor, sql)\n"
+        "    safe_id = int(request.args.get('number'))\n"
+        "    cursor.execute(f'SELECT * FROM accounts WHERE id={safe_id}')\n"
+    );
+    writeFile(
+        workspace / "interprocedural.ts",
+        "const execute = (query: any, db: any) => db.query(query);\n"
+        "function buildSql(id: any) {\n"
+        "  const query = `SELECT * FROM accounts WHERE id=${id}`;\n"
+        "  return query;\n"
+        "}\n"
+        "function handler(req: any, db: any) {\n"
+        "  const id = req.body.id;\n"
+        "  const query = buildSql(id);\n"
+        "  execute(query, db);\n"
+        "  const safeId = Number(req.body.numeric);\n"
+        "  db.query(`SELECT * FROM accounts WHERE id=${safeId}`);\n"
+        "}\n"
+    );
+    writeFile(
+        workspace / "interprocedural.js",
+        "const execute = (query, db) => db.query(query);\n"
+        "function buildSql(id) {\n"
+        "  return `SELECT * FROM accounts WHERE id=${id}`;\n"
+        "}\n"
+        "function handler(req, db) {\n"
+        "  execute(buildSql(req.query.id), db);\n"
+        "}\n"
+    );
     const auto taint_report = scanner.runFiles(
-        {fs::path("tainted.ts"), fs::path("safe.py"), fs::path("tainted.py")},
+        {
+            fs::path("tainted.ts"),
+            fs::path("safe.py"),
+            fs::path("tainted.py"),
+            fs::path("interprocedural.py"),
+            fs::path("interprocedural.ts"),
+            fs::path("interprocedural.js"),
+        },
         std::vector<std::string>{"DATA-001"}
     );
     require(
-        countRule(taint_report, "DATA-001") == 3,
-        "AST taint analysis should detect scoped SQL and dynamic-code flows"
+        countRule(taint_report, "DATA-001") == 6,
+        "Data-flow analysis should detect assignment, branch, argument, and return propagation"
+    );
+    bool python_sql_line = false;
+    bool python_eval_line = false;
+    bool typescript_sql_line = false;
+    bool python_flow_evidence = false;
+    bool typescript_flow_evidence = false;
+    bool javascript_flow_evidence = false;
+    for (const auto& finding : taint_report.findings) {
+        if (finding.rule_id != "DATA-001") {
+            continue;
+        }
+        require(
+            finding.cwe_id ==
+                (finding.title.find("dynamic code") != std::string::npos
+                    ? "CWE-94"
+                    : "CWE-89"),
+            "Data-flow findings should include the matching CWE identifier"
+        );
+        if (finding.file_path == "tainted.py") {
+            python_sql_line = python_sql_line || finding.line_number == 4;
+            python_eval_line = python_eval_line || finding.line_number == 8;
+        } else if (finding.file_path == "tainted.ts") {
+            typescript_sql_line = finding.line_number == 4;
+        } else if (finding.file_path == "interprocedural.py") {
+            python_flow_evidence =
+                finding.line_number == 2 &&
+                std::find(finding.data_flow_lines.begin(), finding.data_flow_lines.end(), 11) !=
+                    finding.data_flow_lines.end();
+        } else if (finding.file_path == "interprocedural.ts") {
+            typescript_flow_evidence =
+                finding.line_number == 1 &&
+                std::find(finding.data_flow_lines.begin(), finding.data_flow_lines.end(), 7) !=
+                    finding.data_flow_lines.end();
+        } else if (finding.file_path == "interprocedural.js") {
+            javascript_flow_evidence =
+                finding.line_number == 1 &&
+                std::find(finding.data_flow_lines.begin(), finding.data_flow_lines.end(), 6) !=
+                    finding.data_flow_lines.end();
+        }
+    }
+    require(
+        python_sql_line && python_eval_line && typescript_sql_line,
+        "Data-flow findings should identify each sink line"
+    );
+    require(python_flow_evidence, "Python findings should include source-to-sink line evidence");
+    require(
+        typescript_flow_evidence,
+        "TypeScript findings should include source-to-sink line evidence"
     );
     require(
-        taint_report.findings[0].line_number == 4 &&
-            taint_report.findings[1].line_number == 8 &&
-            taint_report.findings[2].line_number == 4,
-        "AST taint findings should identify each sink line"
+        javascript_flow_evidence,
+        "JavaScript findings should include source-to-sink line evidence"
     );
     bool rejected_traversal = false;
     try {

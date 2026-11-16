@@ -7,6 +7,7 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PyQt6.QtCore import QSize
 from PyQt6.QtWidgets import QApplication, QBoxLayout
 from PyQt6.QtTest import QTest
 
@@ -111,6 +112,34 @@ class GuiResponsiveTests(unittest.TestCase):
                 self.assertEqual(asset_path("shield-check.svg"), bundled_asset)
                 bundled_asset.unlink()
                 self.assertEqual(asset_path("shield-check.svg"), adjacent_asset)
+
+    def test_asset_icons_render_visible_pixels(self):
+        window = ProtoSecWindow()
+        for filename in (
+            "bug.svg",
+            "copy.svg",
+            "download.svg",
+            "eye.svg",
+            "folder-open.svg",
+            "git-branch.svg",
+            "info.svg",
+            "moon.svg",
+            "scan-search.svg",
+            "shield-check.svg",
+            "sun.svg",
+            "wand-sparkles.svg",
+        ):
+            with self.subTest(filename=filename):
+                image = window._accent_icon(filename).pixmap(QSize(32, 32)).toImage()
+                self.assertFalse(image.isNull())
+                self.assertTrue(
+                    any(
+                        image.pixelColor(x, y).alpha() > 0
+                        for x in range(image.width())
+                        for y in range(image.height())
+                    )
+                )
+        window.close()
 
     def test_optional_scan_and_live_guard_controls_start_disabled(self):
         window = ProtoSecWindow()

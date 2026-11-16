@@ -95,6 +95,7 @@ target_link_libraries(tree_sitter_sql PUBLIC tree_sitter_runtime)
 add_library(protosec_scanner
     core/src/scanner.cpp
     core/src/tree_sitter_comments.cpp
+    core/src/taint_analysis.cpp
 )
 target_include_directories(protosec_scanner PUBLIC core/include)
 target_link_libraries(protosec_scanner

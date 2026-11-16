@@ -21,9 +21,11 @@ struct CommentByteRange {
 };
 
 struct TaintFlow {
+    std::size_t source_start_byte;
     std::size_t sink_start_byte;
     std::string sink;
     bool dynamic_code;
+    std::vector<std::size_t> path_start_bytes;
 };
 
 struct TreeSitterAnalysis {

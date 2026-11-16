@@ -892,6 +892,7 @@ class ProtoSecWindow(QMainWindow):
         tinted = QPixmap(pixmap.size())
         tinted.fill(Qt.GlobalColor.transparent)
         painter = QPainter(tinted)
+        painter.drawPixmap(0, 0, pixmap)
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
         painter.fillRect(tinted.rect(), QColor(THEMES[self.theme_name]["accent"]))
         painter.end()

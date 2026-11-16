@@ -33,7 +33,7 @@ ProtoSec includes rules for common problems such as:
 - Some insecure database, authentication, and configuration patterns.
 - Dependency vulnerabilities, when **Scan CVE** is enabled and an OSV database is installed.
 
-The C++ scanner uses Tree-sitter to understand comments in JavaScript, TypeScript, Python, and SQL. It also checks for some request-input flows into SQL and dynamic-code sinks within a single function. Most other checks are rule-based heuristics.
+The C++ scanner uses Tree-sitter to understand comments in JavaScript, TypeScript, Python, and SQL. Its data-flow graph follows assignments, string-building expressions, conditional branches, arguments, and return values through direct function calls in the same file. It recognizes numeric conversions such as `int()` and `Number()` as sanitizers for these SQL and dynamic-code checks. Data-flow findings include source-to-sink line evidence and a CWE identifier.
 
 ## Features
 
@@ -62,7 +62,7 @@ Normal scans run on your computer; source files are not uploaded to ProtoSec. If
 
 - Findings are suggestions that need review. Rules can miss issues or report false positives.
 - Tree-sitter is used for comment handling and limited analysis; ProtoSec is not a full AST-based analyzer.
-- Taint analysis is limited to assignments inside one function. It does not trace data across functions or verify authentication middleware order exactly.
+- Taint analysis uses a conservative, same-file call graph with name-based function matching. It does not follow imports, resolve ambiguous methods precisely, model every control-flow construct, or verify authentication middleware order exactly. Its context-insensitive call analysis can over-approximate when a function has multiple callers. Only the documented numeric conversions are treated as sanitizers; context-specific escaping is not assumed to be safe.
 - The Python fallback is heuristic and does not use the C++ Tree-sitter analysis.
 - CVE coverage is limited to the supported manifest formats and version ranges. It does not determine whether vulnerable dependency code is reachable in your application.
 - Live Guard can miss changes if the operating system cannot watch every project path.

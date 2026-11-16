@@ -16,6 +16,8 @@ struct Finding {
     std::size_t line_number = 0;
     std::string snippet;
     std::string fix_prompt;
+    std::vector<std::size_t> data_flow_lines;
+    std::string cwe_id;
 };
 
 struct ScanSummary {

@@ -68,9 +68,17 @@ int main(int argc, char* argv[]) {
         workspace / "__tests__" / "ignored.ts",
         "const apiKey = \"sk-cccccccccccccccccccccccccccccccccccccccc\";\n"
     );
+    const auto outside_file = workspace.parent_path() / "outside-secret.py";
+    writeFile(
+        outside_file,
+        "token = \"sk-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\";\n"
+    );
+    std::error_code symlink_error;
+    fs::create_symlink(outside_file, workspace / "linked.py", symlink_error);
 
     const Scanner scanner(workspace, workspace);
     const auto report = scanner.run();
+    fs::remove(outside_file);
     require(report.files_scanned == 5, "Common test directories should be excluded");
     require(countRule(report, "SEC-001") == 1, "A code string secret should be detected once");
     require(countRule(report, "DB-004") == 1, "Only the parsed SQL table should be checked");
@@ -79,5 +87,15 @@ int main(int argc, char* argv[]) {
             require(finding.line_number == 2, "SQL finding should retain its source line");
         }
     }
+    const auto selected_report = scanner.runFiles({fs::path("source.ts")});
+    require(selected_report.files_scanned == 1, "Selected-file scans should omit unchanged files");
+    require(countRule(selected_report, "SEC-001") == 1, "Selected-file scans should retain findings");
+    bool rejected_traversal = false;
+    try {
+        static_cast<void>(scanner.runFiles({fs::path("../outside-secret.py")}));
+    } catch (const std::invalid_argument&) {
+        rejected_traversal = true;
+    }
+    require(rejected_traversal, "Selected-file scans must reject paths outside the project");
     return 0;
 }

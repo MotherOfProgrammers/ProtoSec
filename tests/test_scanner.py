@@ -66,6 +66,26 @@ class ScanRepositoryTests(unittest.TestCase):
             with self.assertRaises(NotADirectoryError):
                 scan_repository(target.name)
 
+    def test_does_not_follow_source_file_symlinks_outside_the_project(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            parent = Path(temporary_directory)
+            root = parent / "project"
+            root.mkdir()
+            outside = parent / "outside.py"
+            outside.write_text(
+                'token = "sk-' + "x" * 40 + '"\n',
+                encoding="utf-8",
+            )
+            try:
+                (root / "linked.py").symlink_to(outside)
+            except OSError as exc:
+                self.skipTest(f"Symlink creation is not available: {exc}")
+
+            report = scan_repository(root)
+
+        self.assertEqual(report["files_scanned"], 0)
+        self.assertEqual(report["findings"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

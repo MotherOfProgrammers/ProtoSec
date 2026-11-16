@@ -9,6 +9,7 @@
 #include <cctype>
 #include <exception>
 #include <iomanip>
+#include <iterator>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -393,6 +394,20 @@ Scanner::Scanner(fs::path root, fs::path scanner_source_root)
     : root_(std::move(root)), scanner_source_root_(std::move(scanner_source_root)) {}
 
 ScanReport Scanner::run(const ProgressCallback& progress) const {
+    return runImpl(nullptr, progress);
+}
+
+ScanReport Scanner::runFiles(
+    const std::vector<fs::path>& relative_files,
+    const ProgressCallback& progress
+) const {
+    return runImpl(&relative_files, progress);
+}
+
+ScanReport Scanner::runImpl(
+    const std::vector<fs::path>* relative_files,
+    const ProgressCallback& progress
+) const {
     if (!fs::exists(root_) || !fs::is_directory(root_)) {
         throw std::invalid_argument("The target path does not exist or is not a directory: " + root_.string());
     }
@@ -416,32 +431,82 @@ ScanReport Scanner::run(const ProgressCallback& progress) const {
         scanner_sources.insert(fs::weakly_canonical(path));
     }
 
-    for (fs::recursive_directory_iterator iterator(root_);
-         iterator != fs::recursive_directory_iterator();
-         ++iterator) {
-        const auto path = iterator->path();
-        if (iterator->is_directory()) {
-            if (kSkippedDirectories.contains(lower(path.filename().string()))) {
-                iterator.disable_recursion_pending();
+    if (relative_files != nullptr) {
+        const auto canonical_root = fs::weakly_canonical(root_);
+        std::unordered_set<fs::path> selected_files;
+        for (const auto& relative_path : *relative_files) {
+            if (relative_path.empty() || relative_path.is_absolute() ||
+                std::find(relative_path.begin(), relative_path.end(), fs::path("..")) != relative_path.end()) {
+                throw std::invalid_argument("Incremental scan paths must be relative to the project root.");
             }
-            continue;
+            const auto path = root_ / relative_path;
+            if (fs::is_symlink(path)) {
+                continue;
+            }
+            if (!fs::is_regular_file(path)) {
+                throw std::runtime_error("Incremental scan file is missing or not regular: " + path.string());
+            }
+            const auto canonical_path = fs::weakly_canonical(path);
+            const auto within_root = canonical_path.lexically_relative(canonical_root);
+            if (within_root.empty() || within_root.is_absolute() ||
+                *within_root.begin() == fs::path("..")) {
+                throw std::invalid_argument("Incremental scan path resolves outside the project root.");
+            }
+            const auto filename = lower(path.filename().string());
+            const auto extension = lower(path.extension().string());
+            if (!hasExtension(path, kAllowedExtensions) && !filename.starts_with(".env")) {
+                continue;
+            }
+            if (scanner_sources.contains(canonical_path)) {
+                continue;
+            }
+            bool skipped_directory = false;
+            for (auto part = within_root.begin(); part != within_root.end(); ++part) {
+                if (std::next(part) != within_root.end() &&
+                    kSkippedDirectories.contains(lower(part->string()))) {
+                    skipped_directory = true;
+                    break;
+                }
+            }
+            if (!skipped_directory) {
+                selected_files.insert(path);
+            }
         }
-        if (!iterator->is_regular_file()) {
-            continue;
-        }
+        files.assign(selected_files.begin(), selected_files.end());
+    } else {
+        for (fs::recursive_directory_iterator iterator(root_);
+             iterator != fs::recursive_directory_iterator();
+             ++iterator) {
+            const auto path = iterator->path();
+            if (iterator->is_symlink()) {
+                if (iterator->is_directory()) {
+                    iterator.disable_recursion_pending();
+                }
+                continue;
+            }
+            if (iterator->is_directory()) {
+                if (kSkippedDirectories.contains(lower(path.filename().string()))) {
+                    iterator.disable_recursion_pending();
+                }
+                continue;
+            }
+            if (!iterator->is_regular_file()) {
+                continue;
+            }
 
-        const auto filename = lower(path.filename().string());
-        const auto extension = lower(path.extension().string());
-        if (!hasExtension(path, kAllowedExtensions) && !filename.starts_with(".env")) {
-            continue;
-        }
+            const auto filename = lower(path.filename().string());
+            const auto extension = lower(path.extension().string());
+            if (!hasExtension(path, kAllowedExtensions) && !filename.starts_with(".env")) {
+                continue;
+            }
 
-        const auto canonical_path = fs::weakly_canonical(path);
-        if (scanner_sources.contains(canonical_path) ||
-            kSkippedDirectories.contains(lower(path.parent_path().filename().string()))) {
-            continue;
+            const auto canonical_path = fs::weakly_canonical(path);
+            if (scanner_sources.contains(canonical_path) ||
+                kSkippedDirectories.contains(lower(path.parent_path().filename().string()))) {
+                continue;
+            }
+            files.push_back(path);
         }
-        files.push_back(path);
     }
 
     std::sort(files.begin(), files.end());

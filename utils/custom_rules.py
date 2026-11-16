@@ -104,7 +104,10 @@ def load_custom_rules(root_path: str | Path) -> list[CustomRule]:
     return rules
 
 
-def scan_custom_rules(root_path: str | Path) -> list[dict]:
+def scan_custom_rules(
+    root_path: str | Path,
+    files: list[Path] | None = None,
+) -> list[dict]:
     root = Path(root_path).resolve(strict=True)
     rules = load_custom_rules(root)
     if not rules:
@@ -114,57 +117,64 @@ def scan_custom_rules(root_path: str | Path) -> list[dict]:
     scanned_files = 0
     scanned_bytes = 0
     started = time.monotonic()
-    for current_root, dirs, filenames in os.walk(root):
-        dirs[:] = [name for name in dirs if name not in SKIP_DIRS]
-        for filename in filenames:
-            path = Path(current_root) / filename
-            if path == root / ".vibeguard.toml":
-                continue
-            if path.suffix.lower() not in wanted_extensions:
-                continue
-            scanned_files += 1
-            if scanned_files > MAX_RULE_SCAN_FILES:
-                raise RuntimeError(
-                    f"Custom rules are limited to {MAX_RULE_SCAN_FILES} files per scan."
-                )
-            file_size = path.stat().st_size
-            if file_size > MAX_RULE_SCAN_FILE_BYTES:
-                raise RuntimeError(
-                    f"Custom-rule scan file exceeds 2 MiB: {path.relative_to(root).as_posix()}"
-                )
-            scanned_bytes += file_size
-            if scanned_bytes > MAX_RULE_SCAN_TOTAL_BYTES:
-                raise RuntimeError("Custom-rule scan exceeded its 128 MiB total input limit.")
-            try:
-                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-            except OSError as exc:
-                raise OSError(f"Could not read custom-rule scan file {path}: {exc}") from exc
+    if files is None:
+        paths = []
+        for current_root, dirs, filenames in os.walk(root):
+            dirs[:] = [name for name in dirs if name not in SKIP_DIRS]
+            paths.extend(Path(current_root) / filename for filename in filenames)
+    else:
+        paths = sorted(Path(path) for path in files)
+    for path in paths:
+        if path.is_symlink() or path == root / ".vibeguard.toml":
+            continue
+        try:
             relative = path.relative_to(root).as_posix()
-            applicable = [rule for rule in rules if path.suffix.lower() in rule.extensions]
-            for line_number, line in enumerate(lines, start=1):
-                for rule in applicable:
-                    if time.monotonic() - started > MAX_RULE_SCAN_SECONDS:
-                        raise RuntimeError("Custom-rule scan exceeded its 30-second time limit.")
-                    try:
-                        match = rule.pattern.search(line, timeout=REGEX_TIMEOUT_SECONDS)
-                    except TimeoutError as exc:
-                        raise RuntimeError(
-                            f"Custom rule {rule.rule_id} exceeded the 25 ms per-line regex limit."
-                        ) from exc
-                    if not match:
-                        continue
-                    matched_text = match.group(0)
-                    findings.append({
-                        "rule_id": rule.rule_id,
-                        "category": "Custom policy",
-                        "severity": rule.severity,
-                        "title": rule.title,
-                        "file_path": relative,
-                        "line_number": line_number,
-                        "snippet": redact_snippet(line, matched_text),
-                        "fix_prompt": (
-                            f"Review custom policy {rule.rule_id} ({rule.title}) at "
-                            f"{relative}:{line_number}."
-                        ),
-                    })
+        except ValueError as exc:
+            raise ValueError(f"Custom-rule scan path is outside the project: {path}") from exc
+        if path.suffix.lower() not in wanted_extensions:
+            continue
+        scanned_files += 1
+        if scanned_files > MAX_RULE_SCAN_FILES:
+            raise RuntimeError(
+                f"Custom rules are limited to {MAX_RULE_SCAN_FILES} files per scan."
+            )
+        file_size = path.stat().st_size
+        if file_size > MAX_RULE_SCAN_FILE_BYTES:
+            raise RuntimeError(
+                f"Custom-rule scan file exceeds 2 MiB: {relative}"
+            )
+        scanned_bytes += file_size
+        if scanned_bytes > MAX_RULE_SCAN_TOTAL_BYTES:
+            raise RuntimeError("Custom-rule scan exceeded its 128 MiB total input limit.")
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as exc:
+            raise OSError(f"Could not read custom-rule scan file {path}: {exc}") from exc
+        applicable = [rule for rule in rules if path.suffix.lower() in rule.extensions]
+        for line_number, line in enumerate(lines, start=1):
+            for rule in applicable:
+                if time.monotonic() - started > MAX_RULE_SCAN_SECONDS:
+                    raise RuntimeError("Custom-rule scan exceeded its 30-second time limit.")
+                try:
+                    match = rule.pattern.search(line, timeout=REGEX_TIMEOUT_SECONDS)
+                except TimeoutError as exc:
+                    raise RuntimeError(
+                        f"Custom rule {rule.rule_id} exceeded the 25 ms per-line regex limit."
+                    ) from exc
+                if not match:
+                    continue
+                matched_text = match.group(0)
+                findings.append({
+                    "rule_id": rule.rule_id,
+                    "category": "Custom policy",
+                    "severity": rule.severity,
+                    "title": rule.title,
+                    "file_path": relative,
+                    "line_number": line_number,
+                    "snippet": redact_snippet(line, matched_text),
+                    "fix_prompt": (
+                        f"Review custom policy {rule.rule_id} ({rule.title}) at "
+                        f"{relative}:{line_number}."
+                    ),
+                })
     return findings

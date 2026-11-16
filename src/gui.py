@@ -1,23 +1,20 @@
 import json
 import os
 import sqlite3
-import subprocess
 import sys
-import threading
 import zipfile
 from pathlib import Path
 
-from src.main import scan_repository
 from src.scanner_rules import ALLOWED_EXTENSIONS, SKIP_DIRS
 from utils.auto_patch import PatchPlan, apply_patch_plan, create_patch_plan
 from utils.cve_audit import database_path, merge_findings, scan_dependencies, update_database
-from utils.custom_rules import scan_custom_rules
 from utils.git_hooks import install_precommit_hook
 from utils.git_history import scan_git_history
 from utils.license_guard import is_pro_unlocked, save_license_key
 from utils.package_reputation import audit_package_reputation
 from utils.passive_probe import probe_security_headers
 from utils.report_exporter import export_html_report, export_json_report
+from utils.incremental_scan import scan_incremental_project
 
 try:
     from PyQt6.QtCore import (
@@ -164,15 +161,10 @@ class ScanWorker(QThread):
 
     def run(self):
         try:
-            binary_path = scanner_binary_path()
-            if binary_path.is_file():
-                report = self._run_cpp(binary_path)
-                report = merge_findings(
-                    report,
-                    scan_custom_rules(self.folder_path),
-                )
-            else:
-                report = scan_repository(self.folder_path, progress_callback=self.progress.emit)
+            report = scan_incremental_project(
+                self.folder_path,
+                progress_callback=self.progress.emit,
+            )
             if self.scan_cve:
                 report = merge_findings(
                     report,
@@ -191,52 +183,6 @@ class ScanWorker(QThread):
             self.completed.emit(report)
         except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
             self.failed.emit(str(exc))
-
-    def _run_cpp(self, binary_path: Path) -> dict:
-        startupinfo = None
-        creationflags = 0
-        if sys.platform == "win32":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = subprocess.SW_HIDE
-            creationflags = subprocess.CREATE_NO_WINDOW
-        process = subprocess.Popen(
-            [str(binary_path), self.folder_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            startupinfo=startupinfo,
-            creationflags=creationflags,
-        )
-        output_chunks = []
-        error_messages = []
-
-        def drain_stdout():
-            if process.stdout is not None:
-                output_chunks.append(process.stdout.read())
-
-        stdout_thread = threading.Thread(target=drain_stdout, daemon=True)
-        stdout_thread.start()
-        if process.stderr is not None:
-            for line in process.stderr:
-                parts = line.rstrip("\r\n").split("\t", 3)
-                if len(parts) == 4 and parts[0] == "PROGRESS":
-                    try:
-                        self.progress.emit("scanning", int(parts[1]), int(parts[2]), parts[3])
-                    except ValueError:
-                        continue
-                elif line.strip():
-                    error_messages.append(line.strip())
-        return_code = process.wait()
-        stdout_thread.join()
-
-        if return_code != 0:
-            message = "\n".join(error_messages)
-            raise RuntimeError(message or "C++ scanner failed. Check that the selected folder is accessible.")
-        return json.loads("".join(output_chunks))
 
 
 class CveUpdateWorker(QThread):

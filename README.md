@@ -17,6 +17,10 @@ If a compiled `scanner_core` binary is found beside the app or in `build/bin` (o
 python -m src.main C:\path\to\project
 ```
 
+Project scans use an incremental cache by default. The SQLite database is stored per user under `%LOCALAPPDATA%\ProtoSec\scan-cache.sqlite3` on Windows or `$XDG_DATA_HOME/ProtoSec/scan-cache.sqlite3` (defaulting to `~/.local/share/ProtoSec/scan-cache.sqlite3`) elsewhere. It stores file hashes, line counts, and redacted finding data—not source contents. Changed files are rescanned, removed files are evicted, and scanner or `.vibeguard.toml` rule changes invalidate cached results. Use `python -m src.main --no-cache C:\path\to\project` to bypass the cache for one scan.
+
+The optional `python -m src.main --serve` API binds to `127.0.0.1` only. It accepts HTTPS repository URLs without embedded credentials, query strings, or fragments; repository cloning is limited to 120 seconds, scans to 180 seconds, and at most two API scans run concurrently. Do not expose this unauthenticated development API on a network interface.
+
 ## Build the standalone desktop app
 
 Install a C++20 compiler and CMake 3.20+, then:

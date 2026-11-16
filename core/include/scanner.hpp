@@ -41,8 +41,17 @@ public:
 
     Scanner(std::filesystem::path root, std::filesystem::path scanner_source_root);
     [[nodiscard]] ScanReport run(const ProgressCallback& progress = {}) const;
+    [[nodiscard]] ScanReport runFiles(
+        const std::vector<std::filesystem::path>& relative_files,
+        const ProgressCallback& progress = {}
+    ) const;
 
 private:
+    [[nodiscard]] ScanReport runImpl(
+        const std::vector<std::filesystem::path>* relative_files,
+        const ProgressCallback& progress
+    ) const;
+
     std::filesystem::path root_;
     std::filesystem::path scanner_source_root_;
 };

@@ -47,6 +47,8 @@ def _collect_dependencies(root: Path) -> list[tuple[str, str, str]]:
         base = Path(current_root)
         if "package.json" in filenames:
             manifest = base / "package.json"
+            if manifest.is_symlink():
+                continue
             if manifest.stat().st_size > MAX_MANIFEST_BYTES:
                 raise ValueError(f"Package manifest exceeds 2 MiB: {manifest}")
             try:
@@ -69,6 +71,8 @@ def _collect_dependencies(root: Path) -> list[tuple[str, str, str]]:
             if not (filename == "requirements.txt" or filename.startswith("requirements") and filename.endswith(".txt")):
                 continue
             manifest = base / filename
+            if manifest.is_symlink():
+                continue
             if manifest.stat().st_size > MAX_MANIFEST_BYTES:
                 raise ValueError(f"Requirements manifest exceeds 2 MiB: {manifest}")
             try:

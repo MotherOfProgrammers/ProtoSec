@@ -1,12 +1,15 @@
 import argparse
 import asyncio
+import ipaddress
 import json
+import logging
 import os
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from src.scanner_rules import ALLOWED_EXTENSIONS, SKIP_DIRS, analyze_file
 from utils.custom_rules import scan_custom_rules
@@ -25,6 +28,16 @@ except ImportError:  # pragma: no cover - fallback for older Pydantic
             self.__dict__.update(data)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+MAX_REPOSITORY_URL_LENGTH = 2048
+CLONE_TIMEOUT_SECONDS = 120
+SCAN_TIMEOUT_SECONDS = 180
+MAX_CONCURRENT_API_SCANS = 2
+_API_SCAN_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_API_SCANS)
+_LOGGER = logging.getLogger(__name__)
+
+
+class RepositoryUrlError(ValueError):
+    pass
 SCANNER_SOURCE_FILES = {
     path.resolve()
     for path in (
@@ -62,6 +75,10 @@ def scan_repository(root_path: Path | str, progress_callback=None) -> dict:
 
         for filename in sorted(filenames):
             candidate = Path(current_root) / filename
+            if candidate.is_symlink():
+                continue
+            if candidate.name == ".vibeguard.toml":
+                continue
             if candidate.resolve() in SCANNER_SOURCE_FILES:
                 continue
             if candidate.suffix.lower() in ALLOWED_EXTENSIONS or candidate.name.lower().startswith(".env"):
@@ -135,36 +152,109 @@ async def run_cpp_scanner(repo_path: str) -> dict:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    stdout, stderr = await process.communicate()
+    stdout, stderr = await _communicate_with_timeout(
+        process, SCAN_TIMEOUT_SECONDS, "C++ scan"
+    )
     if process.returncode != 0:
         raise RuntimeError(stderr.decode() or "Scanner error")
     return json.loads(stdout.decode())
 
 
 class ScanRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
     repo_url: str
 
 
-async def trigger_scan(payload: ScanRequest) -> dict:
-    with tempfile.TemporaryDirectory() as tmpdir:
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            "clone",
-            "--depth",
-            "1",
-            payload.repo_url,
-            tmpdir,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+def _validate_repository_url(repo_url: str) -> str:
+    if not isinstance(repo_url, str) or not repo_url or len(repo_url) > MAX_REPOSITORY_URL_LENGTH:
+        raise RepositoryUrlError("Repository URL must be a non-empty HTTPS URL under 2048 characters.")
+    try:
+        parsed = urlsplit(repo_url)
+        hostname = (parsed.hostname or "").rstrip(".").casefold()
+        port = parsed.port
+    except ValueError as exc:
+        raise RepositoryUrlError("Repository URL is invalid.") from exc
+    if (
+        parsed.scheme.casefold() != "https"
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or port not in (None, 443)
+    ):
+        raise RepositoryUrlError(
+            "Repository URL must use HTTPS and may not contain credentials, query, or fragment."
         )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(stderr.decode() or "Git clone failed")
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        raise RepositoryUrlError("Repository URL may not target localhost.")
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        address = None
+    if address is not None and not address.is_global:
+        raise RepositoryUrlError("Repository URL may not target a private or reserved IP address.")
+    return repo_url
 
-        if scanner_binary_path().is_file():
-            return await run_cpp_scanner(tmpdir)
-        return scan_repository(tmpdir)
+
+async def _communicate_with_timeout(
+    process: asyncio.subprocess.Process,
+    timeout_seconds: int,
+    operation: str,
+) -> tuple[bytes, bytes]:
+    try:
+        return await asyncio.wait_for(process.communicate(), timeout_seconds)
+    except asyncio.TimeoutError as exc:
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        await process.wait()
+        raise TimeoutError(f"{operation} exceeded its {timeout_seconds}-second limit.") from exc
+
+
+async def trigger_scan(payload: ScanRequest) -> dict:
+    repo_url = _validate_repository_url(payload.repo_url)
+    async with _API_SCAN_SEMAPHORE:
+        with tempfile.TemporaryDirectory(prefix="protosec-api-") as tmpdir:
+            proc = await asyncio.create_subprocess_exec(
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                "--no-recurse-submodules",
+                repo_url,
+                tmpdir,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            _, stderr = await _communicate_with_timeout(
+                proc, CLONE_TIMEOUT_SECONDS, "Repository clone"
+            )
+            if proc.returncode != 0:
+                _LOGGER.warning("Repository clone failed: %s", stderr.decode(errors="replace")[:2000])
+                raise RuntimeError("Repository clone failed.")
+
+            if scanner_binary_path().is_file():
+                return await run_cpp_scanner(tmpdir)
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-m",
+                "src.main",
+                "--no-cache",
+                tmpdir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=PROJECT_ROOT,
+            )
+            stdout, stderr = await _communicate_with_timeout(
+                process, SCAN_TIMEOUT_SECONDS, "Python scan"
+            )
+            if process.returncode != 0:
+                _LOGGER.warning("Python scan failed: %s", stderr.decode(errors="replace")[:2000])
+                raise RuntimeError("Python scan failed.")
+            return json.loads(stdout.decode())
 
 
 def create_app():
@@ -179,8 +269,13 @@ def create_app():
     async def trigger_scan_api(payload: ScanRequest):
         try:
             return await trigger_scan(payload)
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        except RepositoryUrlError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+        except (OSError, RuntimeError, json.JSONDecodeError) as exc:
+            _LOGGER.exception("API repository scan failed.")
+            raise HTTPException(status_code=502, detail="Repository scan failed.") from exc
 
     return app
 
@@ -196,25 +291,41 @@ def main(argv: list[str] | None = None) -> int:
     server_options.add_argument(
         "--mcp", action="store_true", help="Run the local MCP server over stdio"
     )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Run a full scan without reading or updating the incremental cache",
+    )
     args = parser.parse_args(argv)
 
     if args.mcp:
+        if args.no_cache:
+            parser.error("--no-cache applies only to direct project scans.")
         from src.mcp_server import main as run_mcp_server
 
         run_mcp_server()
         return 0
 
     if args.serve:
+        if args.no_cache:
+            parser.error("--no-cache applies only to direct project scans.")
         app = create_app()
         if app is None:
             print("FastAPI is not installed; cannot start the API server.", file=sys.stderr)
             return 1
         import uvicorn
 
-        uvicorn.run(app, host="0.0.0.0", port=8000)
+        uvicorn.run(app, host="127.0.0.1", port=8000)
         return 0
 
-    report = scan_repository(args.repo_path)
+    if args.no_cache:
+        from utils.incremental_scan import scan_full_project
+
+        report = scan_full_project(args.repo_path)
+    else:
+        from utils.incremental_scan import scan_incremental_project
+
+        report = scan_incremental_project(args.repo_path)
     print(json.dumps(report, indent=2))
     return 0
 

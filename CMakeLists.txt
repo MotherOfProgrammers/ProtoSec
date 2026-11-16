@@ -161,4 +161,15 @@ if(BUILD_TESTING)
             "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_staged_cli.cmake"
     )
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(
+            NAME scanner_python_regressions
+            COMMAND "${Python3_EXECUTABLE}" -m unittest discover -s tests
+        )
+        set_tests_properties(
+            scanner_python_regressions
+            PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        )
+    endif()
 endif()

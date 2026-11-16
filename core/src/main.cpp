@@ -1,4 +1,5 @@
 #include "../include/scanner.hpp"
+#include "../include/rules.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -50,18 +51,53 @@ std::vector<std::filesystem::path> readFileList(const std::filesystem::path& lis
     return paths;
 }
 
+std::vector<std::string> parseRuleIds(const std::string& value) {
+    std::vector<std::string> rule_ids;
+    std::size_t start = 0;
+    while (start < value.size()) {
+        const auto end = value.find(',', start);
+        const auto length = end == std::string::npos ? value.size() - start : end - start;
+        if (length == 0) {
+            throw std::runtime_error("Rule ID list contains an empty value.");
+        }
+        rule_ids.push_back(value.substr(start, length));
+        if (end == std::string::npos) {
+            return rule_ids;
+        }
+        start = end + 1;
+    }
+    throw std::runtime_error("Rule ID list must not be empty.");
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
+    if (argc == 2 && std::string(argv[1]) == "--rule-engine-version") {
+        std::cout << kRuleEngineVersion << '\n';
+        return 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--rule-metadata") {
+        std::cout << serializeRuleMetadata() << '\n';
+        return 0;
+    }
     const bool staged_only = argc == 3 && std::string(argv[1]) == "--staged-only";
-    const bool files_from = argc == 4 && std::string(argv[1]) == "--files-from";
+    const bool files_from = (argc == 4 || argc == 6) &&
+        std::string(argv[1]) == "--files-from";
+    const bool select_rules = argc == 6 &&
+        std::string(argv[4]) == "--only-rules";
     const bool project_directory = argc == 2 &&
         std::string(argv[1]) != "--staged-only" &&
-        std::string(argv[1]) != "--files-from";
-    if (!project_directory && !staged_only && !files_from) {
+        std::string(argv[1]) != "--files-from" &&
+        std::string(argv[1]) != "--rule-engine-version" &&
+        std::string(argv[1]) != "--rule-metadata";
+    if ((!project_directory && !staged_only && !files_from) ||
+        (argc == 6 && !select_rules)) {
         std::cerr << "Usage: scanner_core <project_directory>\n"
                      "       scanner_core --staged-only <snapshot_directory>\n"
-                     "       scanner_core --files-from <project_directory> <nul_list_file>\n";
+                     "       scanner_core --files-from <project_directory> <nul_list_file> "
+                     "[--only-rules <comma-separated-ids>]\n"
+                     "       scanner_core --rule-engine-version\n"
+                     "       scanner_core --rule-metadata\n";
         return 2;
     }
 
@@ -80,7 +116,9 @@ int main(int argc, char* argv[]) {
             }
         };
         const auto report = files_from
-            ? scanner.runFiles(readFileList(argv[3]), progress)
+            ? select_rules
+                ? scanner.runFiles(readFileList(argv[3]), parseRuleIds(argv[5]), progress)
+                : scanner.runFiles(readFileList(argv[3]), progress)
             : scanner.run(progress);
         std::cout << serializeReport(report) << '\n';
         return staged_only && !report.findings.empty() ? 1 : 0;

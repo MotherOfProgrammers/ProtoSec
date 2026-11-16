@@ -1,11 +1,18 @@
 import json
+import os
+import re
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
+import utils.incremental_scan as incremental_scan_module
+from src.scanner_rules import analyze_file
 from utils.incremental_scan import (
+    _scan_cpp_files,
     scan_cache_path,
     scan_full_project,
     scan_incremental_project,
@@ -35,7 +42,7 @@ class IncrementalScanTests(unittest.TestCase):
                 row[1] for row in connection.execute("PRAGMA table_info(file_cache)")
             }
             stored = connection.execute(
-                "SELECT findings_json FROM file_cache"
+                "SELECT findings_json FROM rule_cache"
             ).fetchall()
             connection.close()
 
@@ -55,20 +62,202 @@ class IncrementalScanTests(unittest.TestCase):
             root = Path(temporary_directory) / "project"
             root.mkdir()
             source = root / "app.py"
-            source.write_text("value = 'INTERNAL_ONLY'\n", encoding="utf-8")
+            source.write_text(
+                "value = 'INTERNAL_ONLY'\nother = 'SAFE_ONLY'\n",
+                encoding="utf-8",
+            )
+            config = root / ".vibeguard.toml"
+            config.write_text(
+                '[[rules]]\nid = "CUSTOM-010"\ntitle = "Internal marker"\n'
+                'severity = "LOW"\npattern = "INTERNAL_ONLY"\nextensions = [".py"]\n'
+                '[[rules]]\nid = "CUSTOM-011"\ntitle = "Safe marker"\n'
+                'severity = "LOW"\npattern = "SAFE_ONLY"\nextensions = [".py"]\n',
+                encoding="utf-8",
+            )
             cache = Path(temporary_directory) / "scan-cache.sqlite3"
 
             initial = scan_incremental_project(root, cache_path=cache)
-            (root / ".vibeguard.toml").write_text(
+            config.write_text(
                 '[[rules]]\nid = "CUSTOM-010"\ntitle = "Internal marker"\n'
-                'severity = "LOW"\npattern = "INTERNAL_ONLY"\nextensions = [".py"]\n',
+                'severity = "HIGH"\npattern = "INTERNAL_ONLY"\nextensions = [".py"]\n'
+                '[[rules]]\nid = "CUSTOM-011"\ntitle = "Safe marker"\n'
+                'severity = "LOW"\npattern = "SAFE_ONLY"\nextensions = [".py"]\n',
                 encoding="utf-8",
             )
             updated = scan_incremental_project(root, cache_path=cache)
 
-        self.assertEqual(initial["findings"], [])
-        self.assertIn("CUSTOM-010", {finding["rule_id"] for finding in updated["findings"]})
-        self.assertEqual(updated["incremental"]["files_changed"], 1)
+        self.assertEqual(
+            {finding["rule_id"] for finding in initial["findings"]},
+            {"CUSTOM-010", "CUSTOM-011"},
+        )
+        updated_findings = {finding["rule_id"]: finding for finding in updated["findings"]}
+        self.assertEqual(updated_findings["CUSTOM-010"]["severity"], "HIGH")
+        self.assertIn("CUSTOM-011", updated_findings)
+        self.assertEqual(updated["incremental"]["files_changed"], 0)
+        self.assertEqual(updated["incremental"]["rule_results_scanned"], 1)
+
+    def test_changed_rule_fingerprint_rescans_only_its_results(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "project"
+            root.mkdir()
+            (root / "app.py").write_text("value = 1\n", encoding="utf-8")
+            cache = Path(temporary_directory) / "scan-cache.sqlite3"
+            missing_scanner = Path(temporary_directory) / "missing-scanner.exe"
+
+            with (
+                mock.patch(
+                    "utils.incremental_scan.scanner_binary_path",
+                    return_value=missing_scanner,
+                ),
+                mock.patch(
+                    "utils.incremental_scan._rule_fingerprints",
+                    side_effect=[
+                        {
+                            "python:SEC-001": "secret-v1",
+                            "python:INJ-002": "injection-v1",
+                        },
+                        {
+                            "python:SEC-001": "secret-v2",
+                            "python:INJ-002": "injection-v1",
+                        },
+                    ],
+                ),
+                mock.patch(
+                    "utils.incremental_scan.analyze_file",
+                    wraps=analyze_file,
+                ) as analyzer,
+            ):
+                initial = scan_incremental_project(root, cache_path=cache)
+                updated = scan_incremental_project(root, cache_path=cache)
+                scanned_rule_sets = [
+                    call.args[2] for call in analyzer.call_args_list
+                ]
+
+            with closing(sqlite3.connect(cache)) as connection:
+                cached_results = connection.execute(
+                    "SELECT rule_key, rule_fingerprint FROM rule_cache"
+                ).fetchall()
+
+        self.assertEqual(initial["incremental"]["files_changed"], 1)
+        self.assertEqual(updated["incremental"]["files_changed"], 0)
+        self.assertEqual(updated["incremental"]["rule_results_scanned"], 1)
+        self.assertEqual(updated["incremental"]["rule_results_cached"], 1)
+        self.assertEqual(
+            scanned_rule_sets,
+            [{"SEC-001", "INJ-002"}, {"SEC-001"}],
+        )
+        self.assertEqual(
+            set(cached_results),
+            {("python:SEC-001", "secret-v2"), ("python:INJ-002", "injection-v1")},
+        )
+
+    def test_secret_rule_change_invalidates_only_that_rule_and_entropy_dependency(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            original_fingerprints = incremental_scan_module._rule_fingerprints(
+                root, None, False
+            )
+            changed_rules = tuple(
+                replace(rule, pattern=re.compile("different-secret-pattern", rule.pattern.flags))
+                if rule.rule_id == "SEC-001"
+                else rule
+                for rule in incremental_scan_module.RULES
+            )
+            with mock.patch("utils.incremental_scan.RULES", changed_rules):
+                changed_fingerprints = incremental_scan_module._rule_fingerprints(
+                    root, None, False
+                )
+
+        invalidated = {
+            rule_key
+            for rule_key, fingerprint in original_fingerprints.items()
+            if changed_fingerprints[rule_key] != fingerprint
+        }
+        self.assertEqual(invalidated, {"python:SEC-001", "python:SEC-007"})
+
+    def test_corrupt_cached_findings_warn_and_rescan_file(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "project"
+            root.mkdir()
+            source = root / "app.py"
+            source.write_text("first = 1\nsecond = 2\n", encoding="utf-8")
+            cache = Path(temporary_directory) / "scan-cache.sqlite3"
+            missing_scanner = Path(temporary_directory) / "missing-scanner.exe"
+
+            with mock.patch(
+                "utils.incremental_scan.scanner_binary_path",
+                return_value=missing_scanner,
+            ):
+                scan_incremental_project(root, cache_path=cache)
+                with closing(sqlite3.connect(cache)) as connection:
+                    connection.execute(
+                        "UPDATE rule_cache SET findings_json = ? WHERE rule_key = ?",
+                        ("{invalid-json", "python:SEC-001"),
+                    )
+                    connection.commit()
+
+                with self.assertWarnsRegex(RuntimeWarning, "Discarding invalid cached findings"):
+                    recovered = scan_incremental_project(root, cache_path=cache)
+
+            with closing(sqlite3.connect(cache)) as connection:
+                stored = connection.execute(
+                    "SELECT findings_json FROM rule_cache WHERE rule_key = ?",
+                    ("python:SEC-001",),
+                ).fetchone()[0]
+
+        self.assertEqual(recovered["incremental"]["files_changed"], 0)
+        self.assertEqual(recovered["incremental"]["rule_results_scanned"], 1)
+        self.assertEqual(json.loads(stored), [])
+
+    def test_corrupt_sqlite_cache_is_quarantined_and_rebuilt(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "project"
+            root.mkdir()
+            (root / "app.py").write_text("value = 1\n", encoding="utf-8")
+            cache = Path(temporary_directory) / "scan-cache.sqlite3"
+            cache.write_bytes(b"not a sqlite database")
+            missing_scanner = Path(temporary_directory) / "missing-scanner.exe"
+
+            with mock.patch(
+                "utils.incremental_scan.scanner_binary_path",
+                return_value=missing_scanner,
+            ):
+                with self.assertWarnsRegex(RuntimeWarning, "Corrupt incremental cache"):
+                    report = scan_incremental_project(root, cache_path=cache)
+
+            quarantined = list(Path(temporary_directory).glob("scan-cache.sqlite3.corrupt-*"))
+            with closing(sqlite3.connect(cache)) as connection:
+                row_count = connection.execute(
+                    "SELECT COUNT(*) FROM file_cache"
+                ).fetchone()[0]
+
+        self.assertEqual(report["incremental"]["files_changed"], 1)
+        self.assertEqual(row_count, 1)
+        self.assertEqual(len(quarantined), 1)
+
+    def test_python_fallback_preserves_line_counts_on_unchanged_scans(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "project"
+            root.mkdir()
+            (root / "app.py").write_text(
+                "first = 1\nsecond = 2\nthird = 3\n",
+                encoding="utf-8",
+            )
+            cache = Path(temporary_directory) / "scan-cache.sqlite3"
+            missing_scanner = Path(temporary_directory) / "missing-scanner.exe"
+
+            with mock.patch(
+                "utils.incremental_scan.scanner_binary_path",
+                return_value=missing_scanner,
+            ):
+                first = scan_incremental_project(root, cache_path=cache)
+                second = scan_incremental_project(root, cache_path=cache)
+                full = scan_full_project(root)
+
+        self.assertEqual(first["lines_scanned"], 3)
+        self.assertEqual(second["lines_scanned"], 3)
+        self.assertEqual(full["lines_scanned"], 3)
+        self.assertEqual(second["incremental"]["files_changed"], 0)
 
     def test_incremental_and_full_scans_have_same_findings(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -87,9 +276,67 @@ class IncrementalScanTests(unittest.TestCase):
         self.assertEqual(incremental["summary"], full["summary"])
 
     def test_default_cache_is_per_user_not_inside_project(self):
-        cache = scan_cache_path()
+        with mock.patch.dict(os.environ, {"PROTOSEC_CACHE_PATH": ""}):
+            cache = scan_cache_path()
         self.assertEqual(cache.name, "scan-cache.sqlite3")
         self.assertEqual(cache.parent.name, "ProtoSec")
+
+    def test_cache_path_can_be_configured_with_environment_variable(self):
+        configured = Path("custom-cache.sqlite3")
+        with mock.patch.dict(
+            os.environ, {"PROTOSEC_CACHE_PATH": str(configured)}
+        ):
+            self.assertEqual(scan_cache_path(), configured)
+
+    def test_legacy_cache_schema_migrates_to_per_rule_entries(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "project"
+            root.mkdir()
+            (root / "app.py").write_text("value = 1\n", encoding="utf-8")
+            cache = Path(temporary_directory) / "scan-cache.sqlite3"
+            with closing(sqlite3.connect(cache)) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE file_cache (
+                        project_root TEXT NOT NULL,
+                        engine_fingerprint TEXT NOT NULL,
+                        relative_path TEXT NOT NULL,
+                        file_hash TEXT NOT NULL,
+                        line_count INTEGER NOT NULL,
+                        findings_json TEXT NOT NULL,
+                        PRIMARY KEY (project_root, engine_fingerprint, relative_path)
+                    )
+                    """
+                )
+                connection.execute(
+                    "CREATE TABLE cache_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+                connection.execute(
+                    "INSERT INTO cache_meta VALUES ('schema_version', '1')"
+                )
+
+            missing_scanner = Path(temporary_directory) / "missing-scanner.exe"
+            with mock.patch(
+                "utils.incremental_scan.scanner_binary_path",
+                return_value=missing_scanner,
+            ):
+                report = scan_incremental_project(root, cache_path=cache)
+
+            with closing(sqlite3.connect(cache)) as connection:
+                schema = connection.execute(
+                    "SELECT value FROM cache_meta WHERE key = 'schema_version'"
+                ).fetchone()[0]
+                file_fingerprints = connection.execute(
+                    "SELECT DISTINCT engine_fingerprint FROM file_cache"
+                ).fetchall()
+                rule_count = connection.execute(
+                    "SELECT COUNT(*) FROM rule_cache"
+                ).fetchone()[0]
+
+        self.assertEqual(schema, "2")
+        self.assertEqual(file_fingerprints, [("per-rule-v2",)])
+        self.assertGreater(rule_count, 0)
+        self.assertEqual(report["incremental"]["files_changed"], 1)
 
     def test_cpp_engine_uses_file_list_when_available(self):
         from src.main import scanner_binary_path
@@ -113,6 +360,50 @@ class IncrementalScanTests(unittest.TestCase):
         self.assertEqual(second["incremental"]["files_cached"], 2)
         self.assertEqual(first["findings"], second["findings"])
         self.assertTrue(any(finding["rule_id"] == "SEC-001" for finding in first["findings"]))
+
+    def test_cpp_rule_change_rescans_only_the_changed_rule(self):
+        from src.main import scanner_binary_path
+
+        if not scanner_binary_path().is_file():
+            self.skipTest("C++ scanner is not built in this environment.")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "project"
+            root.mkdir()
+            (root / "app.py").write_text(
+                'token = "sk-' + "x" * 40 + '"\nvalue = eval(user_input)\n',
+                encoding="utf-8",
+            )
+            cache = Path(temporary_directory) / "scan-cache.sqlite3"
+
+            with (
+                mock.patch(
+                    "utils.incremental_scan._rule_fingerprints",
+                    side_effect=[
+                        {
+                            "cpp:SEC-001": "secret-v1",
+                            "cpp:INJ-002": "injection-v1",
+                        },
+                        {
+                            "cpp:SEC-001": "secret-v2",
+                            "cpp:INJ-002": "injection-v1",
+                        },
+                    ],
+                ),
+                mock.patch(
+                    "utils.incremental_scan._scan_cpp_files",
+                    wraps=_scan_cpp_files,
+                ) as native_scan,
+            ):
+                first = scan_incremental_project(root, cache_path=cache)
+                second = scan_incremental_project(root, cache_path=cache)
+                selected_rules = [
+                    call.kwargs["rule_ids"] for call in native_scan.call_args_list
+                ]
+
+        self.assertEqual(first["incremental"]["rule_results_scanned"], 2)
+        self.assertEqual(second["incremental"]["rule_results_scanned"], 1)
+        self.assertEqual(second["incremental"]["rule_results_cached"], 1)
+        self.assertEqual(selected_rules, [["INJ-002", "SEC-001"], ["SEC-001"]])
 
 
 if __name__ == "__main__":

@@ -107,9 +107,13 @@ def load_custom_rules(root_path: str | Path) -> list[CustomRule]:
 def scan_custom_rules(
     root_path: str | Path,
     files: list[Path] | None = None,
+    rule_ids: set[str] | None = None,
 ) -> list[dict]:
     root = Path(root_path).resolve(strict=True)
-    rules = load_custom_rules(root)
+    rules = [
+        rule for rule in load_custom_rules(root)
+        if rule_ids is None or rule.rule_id in rule_ids
+    ]
     if not rules:
         return []
     wanted_extensions = set().union(*(rule.extensions for rule in rules))

@@ -17,7 +17,7 @@ If a compiled `scanner_core` binary is found beside the app or in `build/bin` (o
 python -m src.main C:\path\to\project
 ```
 
-Project scans use an incremental cache by default. The SQLite database is stored per user under `%LOCALAPPDATA%\ProtoSec\scan-cache.sqlite3` on Windows or `$XDG_DATA_HOME/ProtoSec/scan-cache.sqlite3` (defaulting to `~/.local/share/ProtoSec/scan-cache.sqlite3`) elsewhere. It stores file hashes, line counts, and redacted finding data—not source contents. Changed files are rescanned, removed files are evicted, and scanner or `.vibeguard.toml` rule changes invalidate cached results. Use `python -m src.main --no-cache C:\path\to\project` to bypass the cache for one scan.
+Project scans use an incremental per-rule cache by default. The SQLite database is stored per user under `%LOCALAPPDATA%\ProtoSec\scan-cache.sqlite3` on Windows or `$XDG_DATA_HOME/ProtoSec/scan-cache.sqlite3` (defaulting to `~/.local/share/ProtoSec/scan-cache.sqlite3`) elsewhere. Set `PROTOSEC_CACHE_PATH` to select another database file. The cache stores file hashes, line counts, and redacted findings—not source contents—and includes a schema version. Changed files rerun all active rules; a changed rule fingerprint reruns only that rule across files (plus declared dependencies such as secret suppression for entropy checks). Scan reports include per-rule cache hit statistics. Corrupt results are rescanned, and an unreadable SQLite database is preserved with a `.corrupt-*` suffix before rebuilding. Use `python -m src.main --no-cache C:\path\to\project` to bypass the cache for one scan.
 
 The optional `python -m src.main --serve` API binds to `127.0.0.1` only. It accepts HTTPS repository URLs without embedded credentials, query strings, or fragments; repository cloning is limited to 120 seconds, scans to 180 seconds, and at most two API scans run concurrently. Do not expose this unauthenticated development API on a network interface.
 
@@ -31,6 +31,8 @@ python build.py
 ```
 
 The build produces a one-file, windowed PyInstaller app in `dist/` and bundles the CMake-built scanner, icon assets, and Tree-sitter license notices from `licenses/`. For convenience, `build.py` also copies `assets/` and `licenses/` next to the executable; frozen path resolution supports both embedded one-file resources and adjacent assets. The OSV database is not bundled: it is downloaded on request to the per-user data directory. CMake downloads pinned Tree-sitter runtime and grammar sources on the first build, so that build requires network access. Run the build separately on each target OS; native PyInstaller executables are not cross-compiled. The release CMake configuration enables optimized builds and link-time optimization without assuming host-specific CPU instructions.
+
+Run `ctest --test-dir build/cmake --output-on-failure` after building to execute the native tests and, when CMake finds Python, the Python regression suite. `build.py` configures CTest to use the same Python interpreter used to package ProtoSec.
 
 ## Scanner coverage
 

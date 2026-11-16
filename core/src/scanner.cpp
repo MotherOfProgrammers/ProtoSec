@@ -191,7 +191,18 @@ struct FileResult {
     std::size_t line_count = 0;
 };
 
-FileResult analyzeFile(const fs::path& file_path, const fs::path& root_path) {
+bool isRuleSelected(
+    const std::unordered_set<std::string>* rule_ids,
+    const std::string& rule_id
+) {
+    return rule_ids == nullptr || rule_ids->contains(rule_id);
+}
+
+FileResult analyzeFile(
+    const fs::path& file_path,
+    const fs::path& root_path,
+    const std::unordered_set<std::string>* selected_rule_ids
+) {
     MappedFile mapped(file_path);
     if (!mapped.isValid()) {
         throw std::runtime_error("Could not map source file: " + file_path.string());
@@ -214,7 +225,8 @@ FileResult analyzeFile(const fs::path& file_path, const fs::path& root_path) {
         analysis_content = masked_content;
     }
 
-    if (filename.starts_with(".env") && !kEnvTemplates.contains(filename)) {
+    if (isRuleSelected(selected_rule_ids, "ENV-002") &&
+        filename.starts_with(".env") && !kEnvTemplates.contains(filename)) {
         addFinding(
             result.findings, "ENV-002", "Exposure", "HIGH",
             "Environment file present in project tree", relative_path, 1, filename,
@@ -238,11 +250,19 @@ FileResult analyzeFile(const fs::path& file_path, const fs::path& root_path) {
             if (!hasRuleExtension(extension, rule)) {
                 continue;
             }
+            if (selected_rule_ids != nullptr &&
+                !selected_rule_ids->contains(rule.id) &&
+                !rule.id.starts_with("SEC-")) {
+                continue;
+            }
             std::match_results<std::string_view::const_iterator> match;
             if (!std::regex_search(line.begin(), line.end(), match, rule.pattern)) {
                 continue;
             }
             recognized_secret = recognized_secret || rule.id.starts_with("SEC-");
+            if (!isRuleSelected(selected_rule_ids, rule.id)) {
+                continue;
+            }
             const auto match_start = static_cast<std::size_t>(match.position());
             const auto match_length = static_cast<std::size_t>(match.length());
             addFinding(
@@ -258,7 +278,7 @@ FileResult analyzeFile(const fs::path& file_path, const fs::path& root_path) {
             );
         }
 
-        if (!recognized_secret) {
+        if (isRuleSelected(selected_rule_ids, "SEC-007") && !recognized_secret) {
             std::match_results<std::string_view::const_iterator> entropy_match;
             if (std::regex_search(line.begin(), line.end(), entropy_match, kEntropyAssignment)) {
                 const auto candidate = line.substr(
@@ -295,7 +315,7 @@ FileResult analyzeFile(const fs::path& file_path, const fs::path& root_path) {
         offset = line_end + 1;
     }
 
-    if (extension == ".sql") {
+    if (isRuleSelected(selected_rule_ids, "DB-004") && extension == ".sql") {
         std::match_results<std::string_view::const_iterator> table_match;
         auto search_start = analysis_content.begin();
         while (std::regex_search(search_start, analysis_content.end(), table_match, kCreateTable)) {
@@ -331,9 +351,10 @@ FileResult analyzeFile(const fs::path& file_path, const fs::path& root_path) {
         }
     }
 
-    if (extension == ".ts" || extension == ".tsx" || extension == ".mts" ||
+    if (isRuleSelected(selected_rule_ids, "API-001") &&
+        (extension == ".ts" || extension == ".tsx" || extension == ".mts" ||
         extension == ".cts" || extension == ".js" || extension == ".jsx" ||
-        extension == ".mjs" || extension == ".cjs") {
+        extension == ".mjs" || extension == ".cjs")) {
         const auto generic_path = "/" + relative_path;
         std::match_results<std::string_view::const_iterator> mutation_match;
         if (generic_path.find("/app/api/") != std::string::npos &&
@@ -350,7 +371,7 @@ FileResult analyzeFile(const fs::path& file_path, const fs::path& root_path) {
         }
     }
 
-    if (extension == ".py") {
+    if (isRuleSelected(selected_rule_ids, "API-003") && extension == ".py") {
         std::match_results<std::string_view::const_iterator> mutation_match;
         if (std::regex_search(analysis_content.begin(), analysis_content.end(), mutation_match, kFastApiMutation) &&
             !std::regex_search(analysis_content.begin(), analysis_content.end(), kFastApiAuth)) {
@@ -366,7 +387,8 @@ FileResult analyzeFile(const fs::path& file_path, const fs::path& root_path) {
     }
 
     std::match_results<std::string_view::const_iterator> cookie_match;
-    if (std::regex_search(analysis_content.begin(), analysis_content.end(), cookie_match, kSetCookie) &&
+    if (isRuleSelected(selected_rule_ids, "AUTH-001") &&
+        std::regex_search(analysis_content.begin(), analysis_content.end(), cookie_match, kSetCookie) &&
         !std::regex_search(analysis_content.begin(), analysis_content.end(), kHttpOnly)) {
         const auto start = static_cast<std::size_t>(cookie_match.position());
         const auto line = lineAt(analysis_content, start);
@@ -394,18 +416,27 @@ Scanner::Scanner(fs::path root, fs::path scanner_source_root)
     : root_(std::move(root)), scanner_source_root_(std::move(scanner_source_root)) {}
 
 ScanReport Scanner::run(const ProgressCallback& progress) const {
-    return runImpl(nullptr, progress);
+    return runImpl(nullptr, nullptr, progress);
 }
 
 ScanReport Scanner::runFiles(
     const std::vector<fs::path>& relative_files,
     const ProgressCallback& progress
 ) const {
-    return runImpl(&relative_files, progress);
+    return runImpl(&relative_files, nullptr, progress);
+}
+
+ScanReport Scanner::runFiles(
+    const std::vector<fs::path>& relative_files,
+    const std::vector<std::string>& rule_ids,
+    const ProgressCallback& progress
+) const {
+    return runImpl(&relative_files, &rule_ids, progress);
 }
 
 ScanReport Scanner::runImpl(
     const std::vector<fs::path>* relative_files,
+    const std::vector<std::string>* rule_ids,
     const ProgressCallback& progress
 ) const {
     if (!fs::exists(root_) || !fs::is_directory(root_)) {
@@ -413,6 +444,23 @@ ScanReport Scanner::runImpl(
     }
 
     const auto start_time = std::chrono::steady_clock::now();
+    std::unordered_set<std::string> selected_rule_ids;
+    const std::unordered_set<std::string> structural_rule_ids = {
+        "ENV-002", "SEC-007", "DB-004", "API-001", "API-003", "AUTH-001",
+    };
+    if (rule_ids != nullptr) {
+        std::unordered_set<std::string> known_rule_ids = structural_rule_ids;
+        for (const auto& rule : securityRules()) {
+            known_rule_ids.insert(rule.id);
+        }
+        for (const auto& rule_id : *rule_ids) {
+            if (!known_rule_ids.contains(rule_id)) {
+                throw std::invalid_argument("Unknown scanner rule ID: " + rule_id);
+            }
+            selected_rule_ids.insert(rule_id);
+        }
+    }
+    const auto* selected_rule_set = rule_ids == nullptr ? nullptr : &selected_rule_ids;
     std::vector<fs::path> files;
     const auto scanner_root = fs::weakly_canonical(scanner_source_root_);
     std::unordered_set<fs::path> scanner_sources;
@@ -532,7 +580,7 @@ ScanReport Scanner::runImpl(
                     break;
                 }
                 try {
-                    results[index] = analyzeFile(files[index], root_);
+                    results[index] = analyzeFile(files[index], root_, selected_rule_set);
                     lines_scanned.fetch_add(results[index].line_count, std::memory_order_relaxed);
                 } catch (const std::exception& error) {
                     errors[index] = error.what();
@@ -621,6 +669,37 @@ std::string serializeReport(const ScanReport& report) {
             output << ',';
         }
         output << serializeFinding(report.findings[index]);
+    }
+    output << "]}";
+    return output.str();
+}
+
+std::string serializeRuleMetadata() {
+    std::ostringstream output;
+    output << "{\"engine_version\":" << kRuleEngineVersion << ",\"rules\":[";
+    const auto& rules = securityRules();
+    for (std::size_t index = 0; index < rules.size(); ++index) {
+        const auto& rule = rules[index];
+        if (index != 0) {
+            output << ',';
+        }
+        output << "{"
+               << "\"id\":" << serializeString(rule.id) << ','
+               << "\"category\":" << serializeString(rule.category) << ','
+               << "\"severity\":" << serializeString(rule.severity) << ','
+               << "\"title\":" << serializeString(rule.title) << ','
+               << "\"pattern\":" << serializeString(rule.pattern_source) << ','
+               << "\"pattern_flags\":" << static_cast<unsigned int>(rule.pattern_flags) << ','
+               << "\"extensions\":[";
+        for (std::size_t extension_index = 0; extension_index < rule.extensions.size(); ++extension_index) {
+            if (extension_index != 0) {
+                output << ',';
+            }
+            output << serializeString(rule.extensions[extension_index]);
+        }
+        output << "],"
+               << "\"fix\":" << serializeString(rule.fix)
+               << '}';
     }
     output << "]}";
     return output.str();

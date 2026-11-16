@@ -45,10 +45,16 @@ public:
         const std::vector<std::filesystem::path>& relative_files,
         const ProgressCallback& progress = {}
     ) const;
+    [[nodiscard]] ScanReport runFiles(
+        const std::vector<std::filesystem::path>& relative_files,
+        const std::vector<std::string>& rule_ids,
+        const ProgressCallback& progress = {}
+    ) const;
 
 private:
     [[nodiscard]] ScanReport runImpl(
         const std::vector<std::filesystem::path>* relative_files,
+        const std::vector<std::string>* rule_ids,
         const ProgressCallback& progress
     ) const;
 
@@ -57,3 +63,4 @@ private:
 };
 
 [[nodiscard]] std::string serializeReport(const ScanReport& report);
+[[nodiscard]] std::string serializeRuleMetadata();

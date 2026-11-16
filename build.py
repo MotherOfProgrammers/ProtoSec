@@ -17,7 +17,15 @@ def run(command: list[str]) -> None:
 
 
 def main() -> int:
-    configure = ["cmake", "-S", str(ROOT), "-B", str(BUILD_DIR), "-DCMAKE_BUILD_TYPE=Release"]
+    configure = [
+        "cmake",
+        "-S",
+        str(ROOT),
+        "-B",
+        str(BUILD_DIR),
+        "-DCMAKE_BUILD_TYPE=Release",
+        f"-DPython3_EXECUTABLE={sys.executable}",
+    ]
     if sys.platform == "win32":
         if shutil.which("ninja"):
             configure.extend(["-G", "Ninja"])

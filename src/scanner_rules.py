@@ -204,7 +204,11 @@ def _finding(rule_id: str, category: str, severity: str, title: str, path: str, 
     }
 
 
-def analyze_file(path: Path, root: Path) -> tuple[list[dict], int]:
+def analyze_file(
+    path: Path,
+    root: Path,
+    rule_ids: set[str] | None = None,
+) -> tuple[list[dict], int]:
     try:
         content = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
@@ -216,7 +220,7 @@ def analyze_file(path: Path, root: Path) -> tuple[list[dict], int]:
     suffix = path.suffix.lower()
     basename = path.name.lower()
 
-    if basename.startswith(".env") and basename not in {
+    if (rule_ids is None or "ENV-002" in rule_ids) and basename.startswith(".env") and basename not in {
         ".env.example", ".env.sample", ".env.template", ".env.example.local",
     }:
         findings.append(_finding(
@@ -230,16 +234,23 @@ def analyze_file(path: Path, root: Path) -> tuple[list[dict], int]:
         for rule in RULES:
             if rule.extensions and suffix not in rule.extensions:
                 continue
+            if (
+                rule_ids is not None
+                and rule.rule_id not in rule_ids
+                and not rule.rule_id.startswith("SEC-")
+            ):
+                continue
             match = rule.pattern.search(line)
             if not match:
                 continue
             matched_secret = matched_secret or rule.rule_id.startswith("SEC-")
-            findings.append(_finding(
-                rule.rule_id, rule.category, rule.severity, rule.title,
-                relative_path, line_number, redact_snippet(line, match.group(0)), rule.fix,
-            ))
+            if rule_ids is None or rule.rule_id in rule_ids:
+                findings.append(_finding(
+                    rule.rule_id, rule.category, rule.severity, rule.title,
+                    relative_path, line_number, redact_snippet(line, match.group(0)), rule.fix,
+                ))
 
-        if not matched_secret:
+        if (rule_ids is None or "SEC-007" in rule_ids) and not matched_secret:
             entropy_match = ENTROPY_ASSIGNMENT.search(line)
             if entropy_match:
                 candidate = entropy_match.group(2)
@@ -253,7 +264,7 @@ def analyze_file(path: Path, root: Path) -> tuple[list[dict], int]:
                         "Move this credential to a server-side secret store and rotate it.",
                     ))
 
-    if suffix == ".sql":
+    if (rule_ids is None or "DB-004" in rule_ids) and suffix == ".sql":
         for match in SQL_CREATE_TABLE.finditer(content):
             table = match.group(1).replace('"', "")
             table_name = table.rsplit(".", 1)[-1]
@@ -270,7 +281,11 @@ def analyze_file(path: Path, root: Path) -> tuple[list[dict], int]:
                     "Enable row-level security and define explicit policies for this table.",
                 ))
 
-    if suffix in {".ts", ".tsx", ".js", ".jsx"} and "/app/api/" in f"/{relative_path}":
+    if (
+        (rule_ids is None or "API-001" in rule_ids)
+        and suffix in {".ts", ".tsx", ".js", ".jsx"}
+        and "/app/api/" in f"/{relative_path}"
+    ):
         mutation = NEXT_MUTATION.search(content)
         if mutation and not NEXT_AUTH.search(content):
             line_number = content.count("\n", 0, mutation.start()) + 1
@@ -280,7 +295,12 @@ def analyze_file(path: Path, root: Path) -> tuple[list[dict], int]:
                 "Add server-side authentication and authorization checks before performing this mutation.",
             ))
 
-    if suffix == ".py" and FASTAPI_MUTATION.search(content) and not FASTAPI_AUTH.search(content):
+    if (
+        (rule_ids is None or "API-003" in rule_ids)
+        and suffix == ".py"
+        and FASTAPI_MUTATION.search(content)
+        and not FASTAPI_AUTH.search(content)
+    ):
         match = FASTAPI_MUTATION.search(content)
         line_number = content.count("\n", 0, match.start()) + 1
         findings.append(_finding(
@@ -289,7 +309,10 @@ def analyze_file(path: Path, root: Path) -> tuple[list[dict], int]:
             "Require an authentication dependency and authorize the requested resource in this route.",
         ))
 
-    if re.search(r"\b(?:set_cookie|Set-Cookie)\b", content, re.IGNORECASE):
+    if (
+        (rule_ids is None or "AUTH-001" in rule_ids)
+        and re.search(r"\b(?:set_cookie|Set-Cookie)\b", content, re.IGNORECASE)
+    ):
         if not re.search(r"\bhttponly\s*=\s*true\b", content, re.IGNORECASE):
             match = re.search(r"\b(?:set_cookie|Set-Cookie)\b", content, re.IGNORECASE)
             line_number = content.count("\n", 0, match.start()) + 1

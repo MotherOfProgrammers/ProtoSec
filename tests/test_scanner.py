@@ -3,12 +3,28 @@ import unittest
 from pathlib import Path
 
 from src.main import scan_repository
-from src.scanner_rules import RULES
+from src.scanner_rules import RULES, analyze_file
 
 
 class ScanRepositoryTests(unittest.TestCase):
     def test_rulebook_has_at_least_twenty_line_rules(self):
         self.assertGreaterEqual(len(RULES), 20)
+
+    def test_selected_rule_scan_does_not_emit_other_rule_findings(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "app.py"
+            source.write_text(
+                'token = "sk-' + "x" * 40 + '"\n'
+                "value = eval(user_input)\n",
+                encoding="utf-8",
+            )
+
+            secret_findings, _ = analyze_file(source, root, {"SEC-001"})
+            injection_findings, _ = analyze_file(source, root, {"INJ-002"})
+
+        self.assertEqual({finding["rule_id"] for finding in secret_findings}, {"SEC-001"})
+        self.assertEqual({finding["rule_id"] for finding in injection_findings}, {"INJ-002"})
 
     def test_scans_security_rules_reports_progress_and_skips_dependencies(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

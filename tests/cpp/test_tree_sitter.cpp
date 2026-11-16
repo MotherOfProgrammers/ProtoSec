@@ -4,6 +4,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -46,6 +47,7 @@ int main(int argc, char* argv[]) {
         workspace / "source.ts",
         "// sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
         "const apiKey = \"sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\";\n"
+        "const value = eval(input);\n"
     );
     writeFile(
         workspace / "comment.js",
@@ -90,6 +92,12 @@ int main(int argc, char* argv[]) {
     const auto selected_report = scanner.runFiles({fs::path("source.ts")});
     require(selected_report.files_scanned == 1, "Selected-file scans should omit unchanged files");
     require(countRule(selected_report, "SEC-001") == 1, "Selected-file scans should retain findings");
+    const auto single_rule_report = scanner.runFiles(
+        {fs::path("source.ts")},
+        std::vector<std::string>{"SEC-001"}
+    );
+    require(countRule(single_rule_report, "SEC-001") == 1, "Selected-rule scans should run the requested rule");
+    require(countRule(single_rule_report, "INJ-002") == 0, "Selected-rule scans should omit other rules");
     bool rejected_traversal = false;
     try {
         static_cast<void>(scanner.runFiles({fs::path("../outside-secret.py")}));

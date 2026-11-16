@@ -25,7 +25,9 @@ _CPP_EXTRA_SKIP_DIRS = {"__tests__", "spec", "specs", "test", "tests"}
 _STRUCTURAL_RULE_IDS = {
     "ENV-002", "SEC-007", "DB-004", "API-001", "API-003", "AUTH-001",
 }
+_CPP_STRUCTURAL_RULE_IDS = {"DATA-001"}
 _FILE_CACHE_FINGERPRINT = "per-rule-v2"
+_FULL_HASH_VERIFY_INTERVAL_NS = 24 * 60 * 60 * 1_000_000_000
 
 
 def scan_cache_path() -> Path:
@@ -57,6 +59,17 @@ def _digest_file(path: Path) -> str:
         while chunk := source.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _file_metadata(path: Path) -> tuple[int, int, int, int, int]:
+    stat = path.stat()
+    return (
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+        stat.st_dev,
+        stat.st_ino,
+    )
 
 
 def _digest_and_line_count(path: Path, use_cpp: bool) -> tuple[str, int]:
@@ -198,7 +211,10 @@ def _rule_fingerprints(
         engine_fingerprint = _python_engine_fingerprint()
         builtin_rules = {rule.rule_id: _rule_material(rule) for rule in RULES}
     fingerprints = {}
-    for rule_id in set(builtin_rules) | _STRUCTURAL_RULE_IDS:
+    structural_rule_ids = _STRUCTURAL_RULE_IDS | (
+        _CPP_STRUCTURAL_RULE_IDS if use_cpp else set()
+    )
+    for rule_id in set(builtin_rules) | structural_rule_ids:
         digest = hashlib.sha256(engine_fingerprint.encode("ascii"))
         digest.update(rule_id.encode("utf-8"))
         if rule_id in builtin_rules:
@@ -285,6 +301,11 @@ def _open_cache(path: Path) -> sqlite3.Connection:
                 relative_path TEXT NOT NULL,
                 file_hash TEXT NOT NULL,
                 line_count INTEGER NOT NULL,
+                file_size INTEGER NOT NULL DEFAULT -1,
+                mtime_ns INTEGER NOT NULL DEFAULT -1,
+                ctime_ns INTEGER NOT NULL DEFAULT -1,
+                device INTEGER NOT NULL DEFAULT -1,
+                inode INTEGER NOT NULL DEFAULT -1,
                 findings_json TEXT NOT NULL,
                 PRIMARY KEY (project_root, engine_fingerprint, relative_path)
             )
@@ -306,18 +327,34 @@ def _open_cache(path: Path) -> sqlite3.Connection:
         connection.execute(
             "CREATE TABLE IF NOT EXISTS cache_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS project_scan_state (
+                project_root TEXT PRIMARY KEY,
+                last_full_hash_ns INTEGER NOT NULL
+            )
+            """
+        )
+        file_cache_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(file_cache)")
+        }
+        for column in ("file_size", "mtime_ns", "ctime_ns", "device", "inode"):
+            if column not in file_cache_columns:
+                connection.execute(
+                    f"ALTER TABLE file_cache ADD COLUMN {column} INTEGER NOT NULL DEFAULT -1"
+                )
         schema = connection.execute(
             "SELECT value FROM cache_meta WHERE key = 'schema_version'"
         ).fetchone()
         if schema is None:
             connection.execute(
-                "INSERT INTO cache_meta (key, value) VALUES ('schema_version', '2')"
+                "INSERT OR IGNORE INTO cache_meta (key, value) VALUES ('schema_version', '3')"
             )
-        elif schema[0] == "1":
+        elif schema[0] in {"1", "2"}:
             connection.execute(
-                "UPDATE cache_meta SET value = '2' WHERE key = 'schema_version'"
+                "UPDATE cache_meta SET value = '3' WHERE key = 'schema_version'"
             )
-        elif schema[0] != "2":
+        elif schema[0] != "3":
             raise RuntimeError(f"Unsupported scan cache schema version: {schema[0]}")
         connection.commit()
     except (sqlite3.DatabaseError, RuntimeError):
@@ -346,22 +383,49 @@ def _load_entries(
     path: Path,
     project_root: str,
 ) -> tuple[
-    dict[str, tuple[str, int]],
+    dict[str, tuple[str, int, int, int, int, int, int]],
     dict[str, dict[str, tuple[str, str, list[dict]]]],
+    int,
 ]:
     try:
         with closing(_open_cache(path)) as connection:
             file_entries = {
-                relative_path: (file_hash, line_count)
-                for relative_path, file_hash, line_count in connection.execute(
+                relative_path: (
+                    file_hash,
+                    line_count,
+                    file_size,
+                    mtime_ns,
+                    ctime_ns,
+                    device,
+                    inode,
+                )
+                for (
+                    relative_path,
+                    file_hash,
+                    line_count,
+                    file_size,
+                    mtime_ns,
+                    ctime_ns,
+                    device,
+                    inode,
+                ) in connection.execute(
                     """
-                    SELECT relative_path, file_hash, line_count
+                    SELECT relative_path, file_hash, line_count, file_size, mtime_ns,
+                           ctime_ns, device, inode
                     FROM file_cache
                     WHERE project_root = ? AND engine_fingerprint = ?
                     """,
                     (project_root, _FILE_CACHE_FINGERPRINT),
                 )
             }
+            state = connection.execute(
+                """
+                SELECT last_full_hash_ns FROM project_scan_state
+                WHERE project_root = ?
+                """,
+                (project_root,),
+            ).fetchone()
+            last_full_hash_ns = state[0] if state else 0
             rows = connection.execute(
                 """
                 SELECT relative_path, rule_key, file_hash, rule_fingerprint, findings_json
@@ -389,7 +453,7 @@ def _load_entries(
                 rule_entries.setdefault(relative_path, {})[rule_key] = (
                     file_hash, fingerprint, findings
                 )
-            return file_entries, rule_entries
+            return file_entries, rule_entries, last_full_hash_ns
     except sqlite3.DatabaseError as exc:
         if not _is_corrupt_database(exc):
             raise
@@ -400,19 +464,20 @@ def _load_entries(
             RuntimeWarning,
             stacklevel=2,
         )
-        return {}, {}
+        return {}, {}, 0
 
 
 def _store_entries(
     path: Path,
     project_root: str,
-    old_file_entries: dict[str, tuple[str, int]],
+    old_file_entries: dict[str, tuple[str, int, int, int, int, int, int]],
     current_paths: set[str],
-    file_entries: dict[str, tuple[str, int]],
+    file_entries: dict[str, tuple[str, int, int, int, int, int, int]],
     active_rule_keys: set[str],
     updated_rule_entries: dict[
         tuple[str, str], tuple[str, str, list[dict]]
     ],
+    last_full_hash_ns: int | None,
 ) -> None:
     with closing(_open_cache(path)) as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -431,11 +496,17 @@ def _store_entries(
         connection.executemany(
             """
             INSERT INTO file_cache
-                (project_root, engine_fingerprint, relative_path, file_hash, line_count, findings_json)
-            VALUES (?, ?, ?, ?, ?, '[]')
+                (project_root, engine_fingerprint, relative_path, file_hash, line_count,
+                 file_size, mtime_ns, ctime_ns, device, inode, findings_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]')
             ON CONFLICT(project_root, engine_fingerprint, relative_path) DO UPDATE SET
                 file_hash = excluded.file_hash,
                 line_count = excluded.line_count,
+                file_size = excluded.file_size,
+                mtime_ns = excluded.mtime_ns,
+                ctime_ns = excluded.ctime_ns,
+                device = excluded.device,
+                inode = excluded.inode,
                 findings_json = '[]'
             """,
             [
@@ -445,10 +516,33 @@ def _store_entries(
                     relative_path,
                     file_hash,
                     line_count,
+                    file_size,
+                    mtime_ns,
+                    ctime_ns,
+                    device,
+                    inode,
                 )
-                for relative_path, (file_hash, line_count) in file_entries.items()
+                for relative_path, (
+                    file_hash,
+                    line_count,
+                    file_size,
+                    mtime_ns,
+                    ctime_ns,
+                    device,
+                    inode,
+                ) in file_entries.items()
             ],
         )
+        if last_full_hash_ns is not None:
+            connection.execute(
+                """
+                INSERT INTO project_scan_state (project_root, last_full_hash_ns)
+                VALUES (?, ?)
+                ON CONFLICT(project_root) DO UPDATE SET
+                    last_full_hash_ns = excluded.last_full_hash_ns
+                """,
+                (project_root, last_full_hash_ns),
+            )
         cached_rules = connection.execute(
             "SELECT relative_path, rule_key FROM rule_cache WHERE project_root = ?",
             (project_root,),
@@ -569,10 +663,13 @@ def _scan_python_files(
     rule_ids: set[str] | None = None,
 ) -> dict[str, tuple[int, list[dict]]]:
     results = {}
+    progress_interval = max(1, len(files) // 100)
     for index, (relative_path, path) in enumerate(files, start=1):
         findings, line_count = analyze_file(path, root, rule_ids)
         results[relative_path] = (line_count, findings)
-        if progress_callback:
+        if progress_callback and (
+            index % progress_interval == 0 or index == len(files)
+        ):
             progress_callback("scanning", index, len(files), relative_path)
     return results
 
@@ -629,6 +726,7 @@ def scan_incremental_project(
     root_path: str | Path,
     progress_callback=None,
     cache_path: str | Path | None = None,
+    force_hash_paths: set[str | Path] | None = None,
 ) -> dict:
     root = Path(root_path).resolve(strict=True)
     if not root.is_dir():
@@ -639,14 +737,56 @@ def scan_incremental_project(
     rule_fingerprints = _rule_fingerprints(root, binary if use_cpp else None, use_cpp)
     project_key = os.path.normcase(str(root))
     cache_file = Path(cache_path) if cache_path is not None else scan_cache_path()
+    forced_paths = set()
+    for changed_path in force_hash_paths or ():
+        candidate = Path(changed_path)
+        if candidate.is_absolute():
+            try:
+                candidate = candidate.resolve(strict=False).relative_to(root)
+            except ValueError as exc:
+                raise ValueError("Forced hash paths must stay inside the project root.") from exc
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise ValueError("Forced hash paths must stay inside the project root.")
+        forced_paths.add(candidate.as_posix())
+
     files = _discover_files(root, use_cpp)
+    old_file_entries, old_rule_entries, last_full_hash_ns = _load_entries(
+        cache_file, project_key
+    )
+    now_ns = time.time_ns()
+    full_hash_verification = (
+        last_full_hash_ns == 0
+        or now_ns - last_full_hash_ns >= _FULL_HASH_VERIFY_INTERVAL_NS
+    )
     file_hashes = {}
+    file_metadata = {}
+    hashed_paths = set()
+    bytes_hashed = 0
+    progress_interval = max(1, len(files) // 100)
     for index, (relative_path, path) in enumerate(files, start=1):
-        file_hashes[relative_path] = _digest_and_line_count(path, use_cpp)
-        if progress_callback:
+        metadata = _file_metadata(path)
+        cached_file = old_file_entries.get(relative_path)
+        metadata_matches = (
+            cached_file is not None
+            and cached_file[2:] == metadata
+        )
+        if (
+            not metadata_matches
+            or full_hash_verification
+            or relative_path in forced_paths
+        ):
+            file_hash, line_count = _digest_and_line_count(path, use_cpp)
+            hashed_paths.add(relative_path)
+            bytes_hashed += metadata[0]
+        else:
+            file_hash, line_count = cached_file[0], cached_file[1]
+        file_hashes[relative_path] = (file_hash, line_count)
+        file_metadata[relative_path] = metadata
+        if progress_callback and (
+            index % progress_interval == 0 or index == len(files)
+        ):
             progress_callback("hashing", index, len(files), relative_path)
 
-    old_file_entries, old_rule_entries = _load_entries(cache_file, project_key)
     changed_paths = {
         relative_path
         for relative_path, _ in files
@@ -765,17 +905,20 @@ def scan_incremental_project(
                     findings_by_file[relative_path][rule_id],
                 )
 
-    scanned_paths = set(pending_rule_keys)
     for relative_path, path in files:
-        if relative_path in scanned_paths and _digest_file(path) != file_hashes[relative_path][0]:
+        if _file_metadata(path) != file_metadata[relative_path]:
             raise RuntimeError(
-                f"File changed during scan; rerun to avoid stale results: {relative_path}"
+                f"File metadata changed during scan; rerun for consistent results: {relative_path}"
             )
     if set(path for path, _ in _discover_files(root, use_cpp)) != set(file_hashes):
         raise RuntimeError("Project files changed during scan; rerun for a consistent result.")
 
     current_file_entries = {
-        relative_path: (file_hashes[relative_path][0], line_counts[relative_path])
+        relative_path: (
+            file_hashes[relative_path][0],
+            line_counts[relative_path],
+            *file_metadata[relative_path],
+        )
         for relative_path, _ in files
     }
     active_rule_keys = set(rule_fingerprints)
@@ -787,6 +930,7 @@ def scan_incremental_project(
         current_file_entries,
         active_rule_keys,
         updated_rule_entries,
+        time.time_ns() if full_hash_verification else None,
     )
 
     current_rule_entries = {
@@ -827,5 +971,9 @@ def scan_incremental_project(
             if total_rule_results
             else 0.0
         ),
+        "files_hashed": len(hashed_paths),
+        "files_metadata_cached": len(files) - len(hashed_paths),
+        "bytes_hashed": bytes_hashed,
+        "full_hash_verification": full_hash_verification,
     }
     return report

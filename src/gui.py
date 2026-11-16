@@ -20,7 +20,6 @@ try:
     from PyQt6.QtCore import (
         QFileSystemWatcher,
         QEasingCurve,
-        QPropertyAnimation,
         QThread,
         QSize,
         QTimer,
@@ -28,15 +27,16 @@ try:
         QVariantAnimation,
         pyqtSignal,
     )
+    from PyQt6.QtCore import QAbstractTableModel, QModelIndex
     from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
     from PyQt6.QtWidgets import (
         QApplication,
+        QAbstractItemView,
         QCheckBox,
         QComboBox,
         QDialog,
         QFileDialog,
         QFrame,
-        QGraphicsOpacityEffect,
         QBoxLayout,
         QHBoxLayout,
         QInputDialog,
@@ -50,8 +50,7 @@ try:
         QProgressBar,
         QScrollArea,
         QSplitter,
-        QTableWidget,
-        QTableWidgetItem,
+        QTableView,
         QVBoxLayout,
         QWidget,
         QHeaderView,
@@ -126,6 +125,8 @@ def scanner_binary_path() -> Path:
 
 
 def asset_path(name: str) -> Path:
+    if Path(name).name != name or name in {"", ".", ".."}:
+        raise ValueError("Asset names must be a single filename.")
     application_dir = Path(__file__).resolve().parent.parent
     bundle_dir = Path(getattr(sys, "_MEIPASS", application_dir))
     executable_dir = (
@@ -138,7 +139,102 @@ def asset_path(name: str) -> Path:
         executable_dir / "assets" / name,
         application_dir / "assets" / name,
     )
-    return next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(f"ProtoSec asset is missing: {name}")
+
+
+class FindingsTableModel(QAbstractTableModel):
+    HEADERS = ("SEVERITY", "DETECTION", "LOCATION", "ACTION")
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._findings = []
+        self._visible_rows = []
+        self._query = ""
+        self._severity = "ALL SEVERITIES"
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self._visible_rows)
+
+    def columnCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.HEADERS)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        finding = self._findings[self._visible_rows[index.row()]]
+        column = index.column()
+        if role == Qt.ItemDataRole.UserRole:
+            return finding
+        if role == Qt.ItemDataRole.ToolTipRole:
+            return str(finding.get("file_path", ""))
+        if role == Qt.ItemDataRole.ForegroundRole and column == 0:
+            severity = str(finding.get("severity", "MEDIUM")).upper()
+            return QColor(SEVERITY_COLORS.get(severity, "#8294aa"))
+        if role == Qt.ItemDataRole.TextAlignmentRole and column == 3:
+            return int(Qt.AlignmentFlag.AlignCenter)
+        if role != Qt.ItemDataRole.DisplayRole:
+            return None
+        if column == 0:
+            return f"  {str(finding.get('severity', 'MEDIUM')).upper()}"
+        if column == 1:
+            return f"{finding.get('rule_id', 'GEN-000')}   {finding.get('title', 'Security finding')}"
+        if column == 2:
+            return f"{finding.get('file_path', '')}:{finding.get('line_number', '')}"
+        return "Copy"
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if (
+            role == Qt.ItemDataRole.DisplayRole
+            and orientation == Qt.Orientation.Horizontal
+            and 0 <= section < len(self.HEADERS)
+        ):
+            return self.HEADERS[section]
+        return None
+
+    def finding_at(self, visible_row: int) -> dict | None:
+        if not 0 <= visible_row < len(self._visible_rows):
+            return None
+        return self._findings[self._visible_rows[visible_row]]
+
+    def set_findings(self, findings: list[dict]):
+        self.beginResetModel()
+        self._findings = findings
+        self._update_visible_rows()
+        self.endResetModel()
+
+    def set_filter(self, query: str, severity: str):
+        query = query.strip().casefold()
+        severity = severity.upper()
+        if query == self._query and severity == self._severity:
+            return
+        self.beginResetModel()
+        self._query = query
+        self._severity = severity
+        self._update_visible_rows()
+        self.endResetModel()
+
+    def _update_visible_rows(self):
+        self._visible_rows = []
+        for index, finding in enumerate(self._findings):
+            severity = str(finding.get("severity", "MEDIUM")).upper()
+            if self._severity != "ALL SEVERITIES" and severity != self._severity:
+                continue
+            if self._query:
+                searchable = " ".join(
+                    (
+                        severity,
+                        str(finding.get("rule_id", "")),
+                        str(finding.get("title", "")),
+                        str(finding.get("file_path", "")),
+                        str(finding.get("line_number", "")),
+                    )
+                ).casefold()
+                if self._query not in searchable:
+                    continue
+            self._visible_rows.append(index)
 
 
 class ScanWorker(QThread):
@@ -152,18 +248,21 @@ class ScanWorker(QThread):
         scan_cve: bool = False,
         check_package_reputation: bool = False,
         scan_history: bool = False,
+        force_hash_paths: set[str] | None = None,
     ):
         super().__init__()
         self.folder_path = folder_path
         self.scan_cve = scan_cve
         self.check_package_reputation = check_package_reputation
         self.scan_history = scan_history
+        self.force_hash_paths = set(force_hash_paths or ())
 
     def run(self):
         try:
             report = scan_incremental_project(
                 self.folder_path,
                 progress_callback=self.progress.emit,
+                force_hash_paths=self.force_hash_paths,
             )
             if self.scan_cve:
                 report = merge_findings(
@@ -220,7 +319,12 @@ class LiveWatchSetupWorker(QThread):
             ):
                 if self.isInterruptionRequested():
                     return
-                dirs[:] = [name for name in dirs if name not in SKIP_DIRS]
+                dirs[:] = [
+                    name
+                    for name in dirs
+                    if name not in SKIP_DIRS
+                    and not (Path(current_root) / name).is_symlink()
+                ]
                 if len(directories) < 1096:
                     directories.append(current_root)
                 else:
@@ -229,6 +333,8 @@ class LiveWatchSetupWorker(QThread):
                     if self.isInterruptionRequested():
                         return
                     path = Path(current_root) / filename
+                    if path.is_symlink():
+                        continue
                     lower_name = filename.lower()
                     dependency_manifest = lower_name == "package-lock.json" or (
                         lower_name.startswith("requirements") and path.suffix.lower() == ".txt"
@@ -378,7 +484,7 @@ class ProtoSecWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ProtoSec v1.0.0 — Local Security Workbench")
-        self.setMinimumSize(760, 560)
+        self.setMinimumSize(560, 460)
         self.resize(1320, 860)
         self.setAcceptDrops(True)
         self.theme_name = "dark"
@@ -391,16 +497,15 @@ class ProtoSecWindow(QMainWindow):
         self._live_watch_refresh_pending = False
         self._live_scan_in_progress = False
         self._live_change_pending = False
-        self._theme_animation = None
         self._score_animation = None
+        self._icon_cache = {}
+        self._pending_changed_files = set()
         self.pro_active, self.license_status = is_pro_unlocked()
         self._ui_ready = False
 
         self.root = QWidget()
         self.root.setObjectName("appRoot")
         self.setCentralWidget(self.root)
-        self.root_effect = QGraphicsOpacityEffect(self.root)
-        self.root.setGraphicsEffect(self.root_effect)
 
         self._build_ui()
         self._build_menu_bar()
@@ -409,7 +514,6 @@ class ProtoSecWindow(QMainWindow):
         self._ui_ready = True
         self._update_responsive_layout(self.width(), self.height())
         self._apply_theme()
-        self._animate_intro()
 
     def _build_ui(self):
         shell = QHBoxLayout(self.root)
@@ -494,6 +598,7 @@ class ProtoSecWindow(QMainWindow):
         heading_widget.setLayout(heading)
         actions_widget = QWidget()
         actions_layout = QHBoxLayout(actions_widget)
+        self.actions_layout = actions_layout
         actions_layout.setContentsMargins(0, 0, 0, 0)
         actions_layout.setSpacing(12)
         self.license_button = QPushButton("Pro active" if self.pro_active else "Activate license")
@@ -524,6 +629,7 @@ class ProtoSecWindow(QMainWindow):
         scan_layout.setContentsMargins(20, 18, 20, 18)
         scan_layout.setSpacing(12)
         scan_heading = QHBoxLayout()
+        self.scan_heading_layout = scan_heading
         scan_title = QLabel("TARGET PROJECT")
         scan_title.setObjectName("cardEyebrow")
         scan_heading.addWidget(scan_title)
@@ -545,6 +651,7 @@ class ProtoSecWindow(QMainWindow):
         scan_layout.addLayout(scan_heading)
 
         picker_row = QHBoxLayout()
+        self.picker_layout = picker_row
         self.path_input = QLineEdit()
         self.path_input.setObjectName("pathInput")
         self.path_input.setReadOnly(True)
@@ -562,6 +669,7 @@ class ProtoSecWindow(QMainWindow):
         scan_layout.addLayout(picker_row)
 
         progress_row = QHBoxLayout()
+        self.progress_layout = progress_row
         self.progress_label = QLabel("Choose a folder to begin.")
         self.progress_label.setObjectName("progressLabel")
         self.progress_bar = QProgressBar()
@@ -576,6 +684,7 @@ class ProtoSecWindow(QMainWindow):
         content_layout.addWidget(scan_card)
 
         stats_row = QHBoxLayout()
+        self.stats_layout = stats_row
         stats_row.setSpacing(14)
         score_card, self.score_value, self.score_caption = self._stat_card(
             "SECURITY SCORE", "--", "Awaiting first scan", "scoreCard"
@@ -604,34 +713,41 @@ class ProtoSecWindow(QMainWindow):
         findings_title_widget.setLayout(findings_title)
         findings_controls = QWidget()
         findings_controls_layout = QHBoxLayout(findings_controls)
+        self.findings_controls_layout = findings_controls_layout
         findings_controls_layout.setContentsMargins(0, 0, 0, 0)
         findings_controls_layout.setSpacing(12)
         self.search_input = QLineEdit()
         self.search_input.setObjectName("searchInput")
         self.search_input.setPlaceholderText("⌕   Search findings")
-        self.search_input.setFixedWidth(220)
-        self.search_input.textChanged.connect(self._filter_findings)
-        findings_controls_layout.addWidget(self.search_input)
+        self.search_input.setMinimumWidth(0)
+        self.search_input.setMaximumWidth(220)
+        self.search_input.textChanged.connect(self._queue_findings_filter)
+        findings_controls_layout.addWidget(self.search_input, 1)
         self.severity_filter = QComboBox()
         self.severity_filter.setObjectName("severityFilter")
-        self.severity_filter.setFixedWidth(156)
+        self.severity_filter.setMinimumWidth(0)
+        self.severity_filter.setMaximumWidth(156)
         self.severity_filter.addItems(["All severities", "Critical", "High", "Medium", "Low"])
-        self.severity_filter.currentTextChanged.connect(self._filter_findings)
-        findings_controls_layout.addWidget(self.severity_filter)
+        self.severity_filter.currentTextChanged.connect(self._queue_findings_filter)
+        findings_controls_layout.addWidget(self.severity_filter, 1)
         findings_header.addWidget(findings_title_widget, 1)
         findings_header.addWidget(findings_controls)
         content_layout.addLayout(findings_header)
 
-        self.table = QTableWidget(0, 4)
+        self.table_model = FindingsTableModel(self)
+        self.table = QTableView()
         self.table.setObjectName("findingsTable")
-        self.table.setHorizontalHeaderLabels(["SEVERITY", "DETECTION", "LOCATION", ""])
+        self.table.setModel(self.table_model)
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(42)
+        self.table.verticalHeader().setMinimumSectionSize(36)
         self.table.setShowGrid(False)
         self.table.setAlternatingRowColors(True)
-        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.table.setWordWrap(False)
         self.table.setMinimumHeight(190)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
@@ -640,10 +756,11 @@ class ProtoSecWindow(QMainWindow):
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
         self.table.setColumnWidth(0, 108)
         self.table.setColumnWidth(2, 190)
-        self.table.setColumnWidth(3, 92)
-        self.table.currentCellChanged.connect(self._show_selected_finding)
-        self.table.cellClicked.connect(self._copy_row_prompt)
+        self.table.setColumnWidth(3, 76)
+        self.table.selectionModel().currentChanged.connect(self._show_selected_finding)
+        self.table.clicked.connect(self._copy_row_prompt)
         content_layout.addWidget(self.table, 1)
+        self.table.hide()
 
         self.empty_state = QLabel("No scan results yet. Choose a project folder and run a scan.")
         self.empty_state.setObjectName("emptyState")
@@ -686,6 +803,10 @@ class ProtoSecWindow(QMainWindow):
         self.main_scroll_area.viewport().setAutoFillBackground(True)
         self.main_scroll_area.setWidget(content)
         shell.addWidget(self.main_scroll_area, 1)
+        self.findings_filter_timer = QTimer(self)
+        self.findings_filter_timer.setSingleShot(True)
+        self.findings_filter_timer.setInterval(140)
+        self.findings_filter_timer.timeout.connect(self._filter_findings)
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
@@ -761,17 +882,22 @@ class ProtoSecWindow(QMainWindow):
         self.about_action = about_action
 
     def _accent_icon(self, filename: str) -> QIcon:
+        cache_key = (filename, self.theme_name)
+        if cache_key in self._icon_cache:
+            return self._icon_cache[cache_key]
         source = QIcon(str(asset_path(filename)))
         pixmap = source.pixmap(QSize(18, 18))
         if pixmap.isNull():
-            return source
+            raise RuntimeError(f"Could not load ProtoSec icon: {filename}")
         tinted = QPixmap(pixmap.size())
         tinted.fill(Qt.GlobalColor.transparent)
         painter = QPainter(tinted)
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
         painter.fillRect(tinted.rect(), QColor(THEMES[self.theme_name]["accent"]))
         painter.end()
-        return QIcon(tinted)
+        icon = QIcon(tinted)
+        self._icon_cache[cache_key] = icon
+        return icon
 
     def _apply_icons(self):
         brand_icon = self._accent_icon("shield-check.svg")
@@ -838,6 +964,7 @@ class ProtoSecWindow(QMainWindow):
             self.live_scan_timer.stop()
             self._live_change_pending = False
             self._live_watch_refresh_pending = False
+            self._pending_changed_files.clear()
             self.status_bar.showMessage("Live Guard stopped.")
             return
         self._refresh_live_watch_paths()
@@ -893,6 +1020,8 @@ class ProtoSecWindow(QMainWindow):
     def _queue_live_scan(self, _path: str):
         if not self.live_guard_checkbox.isChecked():
             return
+        if _path in self.file_watcher.files():
+            self._pending_changed_files.add(_path)
         self._live_change_pending = True
         self.live_scan_timer.start()
 
@@ -959,27 +1088,44 @@ class ProtoSecWindow(QMainWindow):
 
     def _update_responsive_layout(self, width: int, height: int):
         compact = width < 1180
+        narrow = width < 640
         self.sidebar.setFixedWidth(190 if compact else 226)
         self.sidebar.setVisible(width > 820)
         self.topbar_layout.setDirection(
             QBoxLayout.Direction.TopToBottom if compact else QBoxLayout.Direction.LeftToRight
         )
+        narrow_direction = (
+            QBoxLayout.Direction.TopToBottom
+            if narrow
+            else QBoxLayout.Direction.LeftToRight
+        )
+        for layout in (
+            self.actions_layout,
+            self.scan_heading_layout,
+            self.picker_layout,
+            self.progress_layout,
+            self.stats_layout,
+            self.findings_controls_layout,
+        ):
+            layout.setDirection(narrow_direction)
         self.findings_header_layout.setDirection(
             QBoxLayout.Direction.TopToBottom if width < 1100 else QBoxLayout.Direction.LeftToRight
         )
-        horizontal_margin = 16 if width <= 820 else 24 if compact else 32
-        vertical_margin = 16 if height < 700 else 26
+        horizontal_margin = 10 if narrow else 16 if width <= 820 else 24 if compact else 32
+        vertical_margin = 12 if height < 560 else 16 if height < 700 else 26
         self.content_layout.setContentsMargins(
             horizontal_margin,
             vertical_margin,
             horizontal_margin,
-            18 if height < 700 else 28,
+            12 if height < 560 else 18 if height < 700 else 28,
         )
-        self.content_layout.setSpacing(12 if height < 700 else 20)
-        self.progress_bar.setFixedWidth(130 if width < 900 else 190)
-        self.search_input.setFixedWidth(180 if width < 900 else 220)
-        self.severity_filter.setFixedWidth(144 if width < 900 else 156)
-        self.table.setColumnWidth(2, 150 if width < 900 else 190)
+        self.content_layout.setSpacing(10 if narrow or height < 560 else 12 if height < 700 else 20)
+        self.progress_bar.setFixedWidth(115 if narrow else 130 if width < 900 else 190)
+        self.search_input.setMaximumWidth(220)
+        self.severity_filter.setMaximumWidth(156)
+        self.table.setColumnWidth(0, 94 if narrow else 108)
+        self.table.setColumnWidth(2, 108 if narrow else 150 if width < 900 else 190)
+        self.table.setColumnWidth(3, 64 if narrow else 76)
 
     def _stat_card(self, heading: str, value: str, caption: str, name: str):
         card = QFrame()
@@ -1002,6 +1148,7 @@ class ProtoSecWindow(QMainWindow):
         colors = THEMES[self.theme_name]
         self.setStyleSheet(
             """
+            QMainWindow { background: %(background)s; }
             QWidget#appRoot { background: %(background)s; color: %(text)s; }
             QWidget { color: %(text)s; font-family: "Segoe UI Variable", "Segoe UI", sans-serif; font-size: 10pt; }
             QFrame#sidebar { background: %(surface)s; border-right: 1px solid %(border)s; }
@@ -1016,6 +1163,8 @@ class ProtoSecWindow(QMainWindow):
             QLabel#workspaceChip { background: %(selection)s; color: %(accent)s; border: 1px solid %(border)s; border-radius: 8px; padding: 11px 10px; font-weight: 650; }
             QFrame#privacyCard, QFrame#scanCard, QFrame#scoreCard, QFrame#issuesCard, QFrame#engineCard, QFrame#detailCard { background: %(card)s; border: 1px solid %(border)s; border-radius: 13px; }
             QScrollArea#mainScrollArea { border: none; background: %(background)s; }
+            QStatusBar { background: %(surface)s; color: %(muted)s; border-top: 1px solid %(border)s; }
+            QStatusBar::item { border: none; }
             QLabel#privacyTitle { color: %(accent)s; font-size: 8pt; font-weight: 800; }
             QLabel#privacyText, QLabel#subtitle, QLabel#statCaption { color: %(muted)s; }
             QLabel#engineStatus { color: %(accent)s; font-family: "Cascadia Code", "Consolas", monospace; font-size: 8pt; font-weight: 700; }
@@ -1039,8 +1188,8 @@ class ProtoSecWindow(QMainWindow):
             QProgressBar#scanProgress { background: %(secondary)s; border: none; border-radius: 4px; min-height: 7px; max-height: 7px; }
             QProgressBar#scanProgress::chunk { background: %(accent)s; border-radius: 4px; }
             QLabel#progressLabel { color: %(muted)s; font-size: 9pt; }
-            QTableWidget#findingsTable { background: %(card)s; alternate-background-color: %(table_alt)s; border: 1px solid %(border)s; border-radius: 11px; padding: 4px; selection-background-color: %(selection)s; outline: 0; }
-            QTableWidget#findingsTable::item { padding: 8px 7px; border: none; }
+            QTableView#findingsTable { background: %(card)s; alternate-background-color: %(table_alt)s; border: 1px solid %(border)s; border-radius: 11px; padding: 4px; selection-background-color: %(selection)s; outline: 0; }
+            QTableView#findingsTable::item { padding: 8px 7px; border: none; }
             QHeaderView::section { background: %(surface)s; color: %(muted)s; border: none; border-bottom: 1px solid %(border)s; padding: 10px 8px; font-size: 8pt; font-weight: 750; letter-spacing: 0.8px; }
             QLabel#emptyState { color: %(muted)s; padding: 9px; }
             QLabel#detailPrompt { color: %(text)s; background: %(input)s; border: 1px solid %(border)s; border-radius: 8px; padding: 11px 12px; font-family: "Cascadia Code", "Consolas", monospace; font-size: 9pt; }
@@ -1053,41 +1202,17 @@ class ProtoSecWindow(QMainWindow):
         self.main_scroll_area.viewport().setStyleSheet(
             f"background-color: {colors['background']};"
         )
-
-    def _animate_intro(self):
-        self.root_effect.setOpacity(0.0)
-        animation = QPropertyAnimation(self.root_effect, b"opacity", self)
-        animation.setDuration(480)
-        animation.setStartValue(0.0)
-        animation.setEndValue(1.0)
-        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-        animation.start()
-        self._intro_animation = animation
+        self.status_bar.setStyleSheet(
+            f"background-color: {colors['surface']}; color: {colors['muted']}; "
+            f"border-top: 1px solid {colors['border']};"
+        )
 
     def toggle_theme(self):
         self.theme_name = "light" if self.theme_name == "dark" else "dark"
         self.theme_button.setText("Switch to dark" if self.theme_name == "light" else "Switch to light")
-
-        fade_out = QPropertyAnimation(self.root_effect, b"opacity", self)
-        fade_out.setDuration(120)
-        fade_out.setStartValue(1.0)
-        fade_out.setEndValue(0.55)
-        fade_out.setEasingCurve(QEasingCurve.Type.OutQuad)
-
-        def finish_transition():
-            self._apply_theme()
-            self._apply_icons()
-            fade_in = QPropertyAnimation(self.root_effect, b"opacity", self)
-            fade_in.setDuration(230)
-            fade_in.setStartValue(0.55)
-            fade_in.setEndValue(1.0)
-            fade_in.setEasingCurve(QEasingCurve.Type.OutCubic)
-            fade_in.start()
-            self._theme_animation = fade_in
-
-        fade_out.finished.connect(finish_transition)
-        fade_out.start()
-        self._theme_animation = fade_out
+        self._icon_cache.clear()
+        self._apply_theme()
+        self._apply_icons()
 
     def run_scan(self):
         self._start_scan(include_optional_checks=True)
@@ -1110,7 +1235,8 @@ class ProtoSecWindow(QMainWindow):
         self.current_report = None
         self.export_json_button.setEnabled(False)
         self.export_html_button.setEnabled(False)
-        self.table.setRowCount(0)
+        self.table_model.set_findings([])
+        self.table.hide()
         self.findings = []
         self.empty_state.setText("Scanning local files…")
         self.empty_state.show()
@@ -1124,7 +1250,9 @@ class ProtoSecWindow(QMainWindow):
             scan_history=(
                 include_optional_checks and self.history_scan_action.isChecked()
             ),
+            force_hash_paths=set(self._pending_changed_files),
         )
+        self._pending_changed_files.clear()
         self.worker.progress.connect(self._update_progress)
         self.worker.completed.connect(self._scan_completed)
         self.worker.failed.connect(self._scan_failed)
@@ -1235,6 +1363,13 @@ class ProtoSecWindow(QMainWindow):
             self.progress_label.setText(message)
             self.progress_bar.setRange(0, 0)
             return
+        if stage == "hashing":
+            self.progress_bar.setRange(0, total)
+            self.progress_bar.setValue(current)
+            self.progress_label.setText(
+                f"Checking file metadata and hashes {current:,} / {total:,}  ·  {detail}"
+            )
+            return
         if total > 0:
             self.progress_bar.setRange(0, total)
             self.progress_bar.setValue(current)
@@ -1262,11 +1397,24 @@ class ProtoSecWindow(QMainWindow):
         self.progress_label.setText(
             f"Scan complete  ·  {len(self.findings):,} finding(s)  ·  {self.selected_folder}"
         )
-        self.status_bar.showMessage(f"Scan complete · {len(self.findings):,} finding(s)", 5000)
+        cache_stats = report.get("incremental", {})
+        if "bytes_hashed" in cache_stats:
+            cache_message = (
+                f" · {cache_stats.get('files_metadata_cached', 0):,} files reused by metadata"
+                f" · {cache_stats.get('bytes_hashed', 0):,} bytes hashed"
+            )
+        else:
+            cache_message = ""
+        self.status_bar.showMessage(
+            f"Scan complete · {len(self.findings):,} finding(s){cache_message}",
+            8000,
+        )
         self._populate_findings()
         self._notify_live_findings()
 
     def _scan_failed(self, message: str):
+        if self.worker is not None:
+            self._pending_changed_files.update(self.worker.force_hash_paths)
         self._notify_live_findings()
         self._set_idle()
         self.engine_value.setText("ERROR")
@@ -1300,6 +1448,7 @@ class ProtoSecWindow(QMainWindow):
 
     def _set_target_folder(self, folder: Path):
         self.selected_folder = str(folder.resolve())
+        self._pending_changed_files.clear()
         self.path_input.setText(self.selected_folder)
         self.path_input.setToolTip(self.selected_folder)
         self.scan_button.setEnabled(True)
@@ -1332,48 +1481,25 @@ class ProtoSecWindow(QMainWindow):
         self._score_animation.start()
 
     def _populate_findings(self):
-        self.table.setRowCount(len(self.findings))
-        for row, finding in enumerate(self.findings):
-            severity = str(finding.get("severity", "MEDIUM")).upper()
-            rule = finding.get("rule_id", "GEN-000")
-            title = finding.get("title", "Security finding")
-            location = f"{finding.get('file_path', '')}:{finding.get('line_number', '')}"
-
-            severity_item = QTableWidgetItem(f"  {severity}")
-            severity_item.setForeground(QColor(SEVERITY_COLORS.get(severity, "#8294aa")))
-            severity_item.setData(Qt.ItemDataRole.UserRole, finding)
-            self.table.setItem(row, 0, severity_item)
-            self.table.setItem(row, 1, QTableWidgetItem(f"{rule}   {title}"))
-            self.table.setItem(row, 2, QTableWidgetItem(location))
-
-            copy_row_button = QPushButton("Copy")
-            copy_row_button.setObjectName("secondaryButton")
-            copy_row_button.setIcon(self._accent_icon("copy.svg"))
-            copy_row_button.setStyleSheet("padding: 5px 8px;")
-            copy_row_button.setProperty("findingRow", row)
-            copy_row_button.clicked.connect(
-                lambda checked=False, item=finding: self._copy_prompt(item)
-            )
-            self.table.setCellWidget(row, 3, copy_row_button)
-            self.table.setRowHeight(row, 42)
-
-        self.empty_state.setVisible(not self.findings)
+        self.table_model.set_findings(self.findings)
         if not self.findings:
-            self.empty_state.setText("No findings detected. This target is clear based on the enabled rules.")
+            self.empty_state.setText(
+                "No findings detected. This target is clear based on the enabled rules."
+            )
             self.detail_prompt.setText("No remediation prompt is needed.")
             self.copy_button.setEnabled(False)
         else:
-            self.table.setCurrentCell(0, 0)
-            self._show_selected_finding(0, 0, -1, -1)
+            self.table.show()
+            self.table.selectRow(0)
+            self._show_selected_finding(self.table.currentIndex(), QModelIndex())
         self._filter_findings()
 
-    def _show_selected_finding(self, row: int, _column: int, _previous_row: int, _previous_column: int):
-        if row < 0:
+    def _show_selected_finding(self, current: QModelIndex, _previous: QModelIndex):
+        if not current.isValid():
+            self.detail_prompt.setText("Select a finding above to see a suggested fix prompt.")
+            self.copy_button.setEnabled(False)
             return
-        item = self.table.item(row, 0)
-        if item is None:
-            return
-        finding = item.data(Qt.ItemDataRole.UserRole)
+        finding = self.table_model.finding_at(current.row())
         if not finding:
             return
         snippet = finding.get("snippet", "")
@@ -1382,30 +1508,31 @@ class ProtoSecWindow(QMainWindow):
         self.detail_prompt.setText(details)
         self.copy_button.setEnabled(bool(finding.get("fix_prompt")))
 
+    def _queue_findings_filter(self, _value=None):
+        self.findings_filter_timer.start()
+
     def _filter_findings(self, _value=None):
-        query = self.search_input.text().strip().casefold()
+        query = self.search_input.text()
         severity_filter = self.severity_filter.currentText().upper()
-        for row in range(self.table.rowCount()):
-            severity_item = self.table.item(row, 0)
-            detection_item = self.table.item(row, 1)
-            location_item = self.table.item(row, 2)
-            severity = severity_item.text().strip().upper() if severity_item else ""
-            content = " ".join(
-                item.text() for item in (detection_item, location_item) if item is not None
-            ).casefold()
-            hidden = (
-                (severity_filter != "ALL SEVERITIES" and severity != severity_filter)
-                or (query and query not in content and query not in severity.casefold())
+        self.table_model.set_filter(query, severity_filter)
+        visible = self.table_model.rowCount()
+        self.table.setVisible(visible > 0)
+        self.empty_state.setVisible(visible == 0)
+        if visible == 0:
+            self.empty_state.setText(
+                "No findings match the selected search and severity filters."
+                if self.findings
+                else "No findings detected. This target is clear based on the enabled rules."
             )
-            self.table.setRowHidden(row, bool(hidden))
+            self.detail_prompt.setText("Select a finding above to see a suggested fix prompt.")
+            self.copy_button.setEnabled(False)
+        elif not self.table.currentIndex().isValid():
+            self.table.selectRow(0)
 
     def copy_selected_prompt(self):
-        row = self.table.currentRow()
-        if row < 0:
-            return
-        item = self.table.item(row, 0)
-        if item is not None:
-            finding = item.data(Qt.ItemDataRole.UserRole)
+        current = self.table.currentIndex()
+        if current.isValid():
+            finding = self.table_model.finding_at(current.row())
             if finding:
                 self._copy_prompt(finding)
 
@@ -1415,12 +1542,12 @@ class ProtoSecWindow(QMainWindow):
             QApplication.clipboard().setText(prompt)
             self.status_bar.showMessage("Remediation prompt copied to clipboard.", 3500)
 
-    def _copy_row_prompt(self, row: int, _column: int):
-        item = self.table.item(row, 0)
-        if item is not None:
-            finding = item.data(Qt.ItemDataRole.UserRole)
-            if finding:
-                self._copy_prompt(finding)
+    def _copy_row_prompt(self, index: QModelIndex):
+        if not index.isValid() or index.column() != 3:
+            return
+        finding = self.table_model.finding_at(index.row())
+        if finding:
+            self._copy_prompt(finding)
 
     def export_json(self):
         if self.current_report is None:

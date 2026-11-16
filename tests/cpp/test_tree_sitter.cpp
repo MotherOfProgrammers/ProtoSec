@@ -98,6 +98,48 @@ int main(int argc, char* argv[]) {
     );
     require(countRule(single_rule_report, "SEC-001") == 1, "Selected-rule scans should run the requested rule");
     require(countRule(single_rule_report, "INJ-002") == 0, "Selected-rule scans should omit other rules");
+    writeFile(
+        workspace / "tainted.ts",
+        "async function handler(req: any, db: any) {\n"
+        "  const id = req.body.id;\n"
+        "  const sql = `SELECT * FROM accounts WHERE id=${id}`;\n"
+        "  db.query(sql);\n"
+        "}\n"
+        "function unrelated(db: any) {\n"
+        "  db.query(sql);\n"
+        "}\n"
+    );
+    writeFile(
+        workspace / "safe.py",
+        "def handler(request, cursor):\n"
+        "    user_id = request.args.get('id')\n"
+        "    cursor.execute('SELECT id FROM users WHERE id = ?', (user_id,))\n"
+    );
+    writeFile(
+        workspace / "tainted.py",
+        "def handler(request, cursor):\n"
+        "    user_id = request.args.get('id')\n"
+        "    sql = 'SELECT * FROM accounts WHERE id=' + user_id\n"
+        "    cursor.execute(sql)\n"
+        "def unrelated(cursor):\n"
+        "    cursor.execute(sql)\n"
+        "def dynamic(request):\n"
+        "    eval(request.args.get('code'))\n"
+    );
+    const auto taint_report = scanner.runFiles(
+        {fs::path("tainted.ts"), fs::path("safe.py"), fs::path("tainted.py")},
+        std::vector<std::string>{"DATA-001"}
+    );
+    require(
+        countRule(taint_report, "DATA-001") == 3,
+        "AST taint analysis should detect scoped SQL and dynamic-code flows"
+    );
+    require(
+        taint_report.findings[0].line_number == 4 &&
+            taint_report.findings[1].line_number == 8 &&
+            taint_report.findings[2].line_number == 4,
+        "AST taint findings should identify each sink line"
+    );
     bool rejected_traversal = false;
     try {
         static_cast<void>(scanner.runFiles({fs::path("../outside-secret.py")}));

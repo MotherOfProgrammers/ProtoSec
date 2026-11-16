@@ -4,6 +4,7 @@ import ipaddress
 import json
 import logging
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -30,6 +31,9 @@ except ImportError:  # pragma: no cover - fallback for older Pydantic
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MAX_REPOSITORY_URL_LENGTH = 2048
 CLONE_TIMEOUT_SECONDS = 120
+DNS_RESOLUTION_TIMEOUT_SECONDS = 5
+MAX_CLONE_SIZE_BYTES = 250 * 1024 * 1024
+CLONE_SIZE_CHECK_INTERVAL_SECONDS = 0.75
 SCAN_TIMEOUT_SECONDS = 180
 MAX_CONCURRENT_API_SCANS = 2
 _API_SCAN_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_API_SCANS)
@@ -38,6 +42,12 @@ _LOGGER = logging.getLogger(__name__)
 
 class RepositoryUrlError(ValueError):
     pass
+
+
+class CloneLimitError(RuntimeError):
+    pass
+
+
 SCANNER_SOURCE_FILES = {
     path.resolve()
     for path in (
@@ -197,6 +207,88 @@ def _validate_repository_url(repo_url: str) -> str:
     return repo_url
 
 
+def _validate_repository_host(hostname: str) -> set[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    try:
+        results = socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise RepositoryUrlError("Repository hostname could not be resolved.") from exc
+    addresses = {
+        ipaddress.ip_address(result[4][0].split("%", 1)[0])
+        for result in results
+    }
+    if not addresses or any(not address.is_global for address in addresses):
+        raise RepositoryUrlError(
+            "Repository hostname must resolve exclusively to public IP addresses."
+        )
+    return addresses
+
+
+def _directory_size(root: str | Path) -> int:
+    total = 0
+    pending = [Path(root)]
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(Path(entry.path))
+                elif entry.is_file(follow_symlinks=False):
+                    try:
+                        total += entry.stat(follow_symlinks=False).st_size
+                    except FileNotFoundError:
+                        continue
+    return total
+
+
+async def _clone_repository(repo_url: str, destination: str | Path) -> None:
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        "-c",
+        "http.followRedirects=false",
+        "clone",
+        "--depth",
+        "1",
+        "--no-recurse-submodules",
+        repo_url,
+        str(destination),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    communication = asyncio.create_task(
+        _communicate_with_timeout(proc, CLONE_TIMEOUT_SECONDS, "Repository clone")
+    )
+    try:
+        while not communication.done():
+            done, _ = await asyncio.wait(
+                {communication},
+                timeout=CLONE_SIZE_CHECK_INTERVAL_SECONDS,
+            )
+            if done:
+                break
+            size = await asyncio.to_thread(_directory_size, destination)
+            if size > MAX_CLONE_SIZE_BYTES:
+                raise CloneLimitError(
+                    f"Repository clone exceeded the {MAX_CLONE_SIZE_BYTES // (1024 * 1024)} MiB size limit."
+                )
+        _, stderr = await communication
+        if proc.returncode != 0:
+            _LOGGER.warning("Repository clone failed: %s", stderr.decode(errors="replace")[:2000])
+            raise RuntimeError("Repository clone failed.")
+        if await asyncio.to_thread(_directory_size, destination) > MAX_CLONE_SIZE_BYTES:
+            raise CloneLimitError(
+                f"Repository clone exceeded the {MAX_CLONE_SIZE_BYTES // (1024 * 1024)} MiB size limit."
+            )
+    except (TimeoutError, CloneLimitError, OSError, RuntimeError):
+        if proc.returncode is None:
+            proc.kill()
+        await proc.wait()
+        if not communication.done():
+            await communication
+        raise
+
+
 async def _communicate_with_timeout(
     process: asyncio.subprocess.Process,
     timeout_seconds: int,
@@ -217,24 +309,16 @@ async def _communicate_with_timeout(
 async def trigger_scan(payload: ScanRequest) -> dict:
     repo_url = _validate_repository_url(payload.repo_url)
     async with _API_SCAN_SEMAPHORE:
+        hostname = (urlsplit(repo_url).hostname or "").rstrip(".").casefold()
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(_validate_repository_host, hostname),
+                DNS_RESOLUTION_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError("Repository DNS resolution exceeded its time limit.") from exc
         with tempfile.TemporaryDirectory(prefix="protosec-api-") as tmpdir:
-            proc = await asyncio.create_subprocess_exec(
-                "git",
-                "clone",
-                "--depth",
-                "1",
-                "--no-recurse-submodules",
-                repo_url,
-                tmpdir,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-            _, stderr = await _communicate_with_timeout(
-                proc, CLONE_TIMEOUT_SECONDS, "Repository clone"
-            )
-            if proc.returncode != 0:
-                _LOGGER.warning("Repository clone failed: %s", stderr.decode(errors="replace")[:2000])
-                raise RuntimeError("Repository clone failed.")
+            await _clone_repository(repo_url, tmpdir)
 
             if scanner_binary_path().is_file():
                 return await run_cpp_scanner(tmpdir)
@@ -271,6 +355,8 @@ def create_app():
             return await trigger_scan(payload)
         except RepositoryUrlError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except CloneLimitError as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
         except TimeoutError as exc:
             raise HTTPException(status_code=504, detail=str(exc)) from exc
         except (OSError, RuntimeError, json.JSONDecodeError) as exc:

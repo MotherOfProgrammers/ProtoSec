@@ -10,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtWidgets import QApplication, QBoxLayout
 from PyQt6.QtTest import QTest
 
-from src.gui import ProtoSecWindow, asset_path
+from src.gui import FindingsTableModel, ProtoSecWindow, asset_path
 
 
 class GuiResponsiveTests(unittest.TestCase):
@@ -21,15 +21,21 @@ class GuiResponsiveTests(unittest.TestCase):
     def test_narrow_window_reflows_and_scrolls_content(self):
         window = ProtoSecWindow()
         window.show()
-        for width, sidebar_visible in ((800, False), (1024, True), (1320, True)):
-            with self.subTest(width=width):
-                window.resize(width, 600)
+        for width, height, sidebar_visible in (
+            (560, 460, False),
+            (640, 480, False),
+            (800, 600, False),
+            (1024, 600, True),
+            (1320, 860, True),
+        ):
+            with self.subTest(width=width, height=height):
+                window.resize(width, height)
                 self.application.processEvents()
 
                 self.assertEqual(not window.sidebar.isHidden(), sidebar_visible)
                 self.assertGreater(window.main_scroll_area.viewport().height(), 0)
                 self.assertGreater(window.path_input.width(), 200)
-                if width == 800:
+                if width <= 800:
                     self.assertGreater(window.main_scroll_area.verticalScrollBar().maximum(), 0)
                 expected_direction = (
                     QBoxLayout.Direction.TopToBottom
@@ -49,6 +55,42 @@ class GuiResponsiveTests(unittest.TestCase):
                     self.assertFalse(first.intersects(second))
 
         window.close()
+
+    def test_status_bar_tracks_theme_and_theme_switch_is_synchronous(self):
+        window = ProtoSecWindow()
+        window.show()
+        self.application.processEvents()
+
+        self.assertIn("#100d1c", window.status_bar.styleSheet())
+        window.toggle_theme()
+        self.assertIn("#faf8ff", window.status_bar.styleSheet())
+        self.assertEqual(window.theme_name, "light")
+
+        window.close()
+
+    def test_findings_model_filters_without_creating_per_row_widgets(self):
+        model = FindingsTableModel()
+        findings = [
+            {
+                "severity": "HIGH",
+                "rule_id": f"SEC-{index:03d}",
+                "title": f"Sensitive value {index}",
+                "file_path": f"src/file_{index}.py",
+                "line_number": index + 1,
+            }
+            for index in range(5000)
+        ]
+
+        model.set_findings(findings)
+        self.assertEqual(model.rowCount(), 5000)
+        self.assertEqual(model.data(model.index(0, 3)), "Copy")
+
+        model.set_filter("file_42.py", "HIGH")
+        self.assertEqual(model.rowCount(), 1)
+        self.assertEqual(model.data(model.index(0, 2)), "src/file_42.py:43")
+
+        model.set_filter("file_42.py", "CRITICAL")
+        self.assertEqual(model.rowCount(), 0)
 
     def test_asset_path_resolves_bundled_and_adjacent_assets(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -4,6 +4,7 @@ import re
 import sqlite3
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
@@ -49,9 +50,19 @@ class IncrementalScanTests(unittest.TestCase):
         self.assertEqual(first["incremental"]["files_changed"], 2)
         self.assertEqual(second["incremental"]["files_changed"], 0)
         self.assertEqual(second["incremental"]["files_cached"], 2)
+        self.assertEqual(first["incremental"]["files_hashed"], 2)
+        self.assertTrue(first["incremental"]["full_hash_verification"])
+        self.assertEqual(second["incremental"]["files_hashed"], 0)
+        self.assertEqual(second["incremental"]["files_metadata_cached"], 2)
+        self.assertEqual(second["incremental"]["bytes_hashed"], 0)
         self.assertEqual(first["findings"], second["findings"])
         self.assertEqual(third["incremental"]["files_changed"], 1)
         self.assertEqual(third["incremental"]["files_removed"], 1)
+        self.assertEqual(third["incremental"]["files_hashed"], 1)
+        self.assertEqual(
+            third["incremental"]["rule_results_scanned"],
+            first["incremental"]["rule_results_scanned"] // 2,
+        )
         self.assertEqual(third["findings"], [])
         self.assertIn("file_hash", columns)
         self.assertNotIn("source_contents", columns)
@@ -275,6 +286,38 @@ class IncrementalScanTests(unittest.TestCase):
         self.assertEqual(incremental["findings"], full["findings"])
         self.assertEqual(incremental["summary"], full["summary"])
 
+    def test_python_and_cpp_engines_agree_on_shared_rules(self):
+        from src.main import scanner_binary_path
+
+        if not scanner_binary_path().is_file():
+            self.skipTest("C++ scanner is not built in this environment.")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "project"
+            root.mkdir()
+            (root / "app.py").write_text(
+                "token = 'sk-" + "d" * 40 + "'\n"
+                "result = eval(user_input)\n",
+                encoding="utf-8",
+            )
+            cpp_report = scan_incremental_project(
+                root,
+                cache_path=Path(temporary_directory) / "cpp-cache.sqlite3",
+            )
+            with mock.patch(
+                "utils.incremental_scan.scanner_binary_path",
+                return_value=Path(temporary_directory) / "missing-scanner.exe",
+            ):
+                python_report = scan_incremental_project(
+                    root,
+                    cache_path=Path(temporary_directory) / "python-cache.sqlite3",
+                )
+
+        shared_findings = lambda report: {
+            (finding["rule_id"], finding["file_path"], finding["line_number"])
+            for finding in report["findings"]
+        }
+        self.assertEqual(shared_findings(cpp_report), shared_findings(python_report))
+
     def test_default_cache_is_per_user_not_inside_project(self):
         with mock.patch.dict(os.environ, {"PROTOSEC_CACHE_PATH": ""}):
             cache = scan_cache_path()
@@ -333,10 +376,87 @@ class IncrementalScanTests(unittest.TestCase):
                     "SELECT COUNT(*) FROM rule_cache"
                 ).fetchone()[0]
 
-        self.assertEqual(schema, "2")
+        self.assertEqual(schema, "3")
         self.assertEqual(file_fingerprints, [("per-rule-v2",)])
         self.assertGreater(rule_count, 0)
         self.assertEqual(report["incremental"]["files_changed"], 1)
+
+    def test_forced_hash_and_periodic_hash_verification(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "project"
+            root.mkdir()
+            source = root / "app.py"
+            source.write_text("value = 1\n", encoding="utf-8")
+            cache = Path(temporary_directory) / "scan-cache.sqlite3"
+            missing_scanner = Path(temporary_directory) / "missing-scanner.exe"
+
+            with mock.patch(
+                "utils.incremental_scan.scanner_binary_path",
+                return_value=missing_scanner,
+            ):
+                initial = scan_incremental_project(root, cache_path=cache)
+                forced = scan_incremental_project(
+                    root,
+                    cache_path=cache,
+                    force_hash_paths={source},
+                )
+                with closing(sqlite3.connect(cache)) as connection:
+                    old_metadata = connection.execute(
+                        """
+                        SELECT file_size, mtime_ns, ctime_ns, device, inode
+                        FROM file_cache
+                        """
+                    ).fetchone()
+                    connection.execute(
+                        "UPDATE project_scan_state SET last_full_hash_ns = 1"
+                    )
+                    connection.commit()
+
+                source.write_text("value = 2\n", encoding="utf-8")
+                with mock.patch(
+                    "utils.incremental_scan._file_metadata",
+                    return_value=old_metadata,
+                ):
+                    verified = scan_incremental_project(root, cache_path=cache)
+
+        self.assertTrue(initial["incremental"]["full_hash_verification"])
+        self.assertFalse(forced["incremental"]["full_hash_verification"])
+        self.assertEqual(forced["incremental"]["files_hashed"], 1)
+        self.assertTrue(verified["incremental"]["full_hash_verification"])
+        self.assertEqual(verified["incremental"]["files_changed"], 1)
+        self.assertEqual(verified["incremental"]["files_hashed"], 1)
+
+    def test_concurrent_scans_keep_the_cache_consistent(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "project"
+            root.mkdir()
+            (root / "app.py").write_text(
+                "token = 'sk-" + "c" * 40 + "'\n",
+                encoding="utf-8",
+            )
+            cache = Path(temporary_directory) / "scan-cache.sqlite3"
+
+            def scan(_):
+                return scan_incremental_project(root, cache_path=cache)
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                reports = list(executor.map(scan, range(2)))
+
+            with closing(sqlite3.connect(cache)) as connection:
+                file_count = connection.execute(
+                    "SELECT COUNT(*) FROM file_cache"
+                ).fetchone()[0]
+                rule_count = connection.execute(
+                    "SELECT COUNT(*) FROM rule_cache"
+                ).fetchone()[0]
+
+        self.assertEqual(reports[0]["findings"], reports[1]["findings"])
+        self.assertEqual(file_count, 1)
+        self.assertEqual(
+            rule_count,
+            reports[0]["incremental"]["rule_results_scanned"]
+            + reports[0]["incremental"]["rule_results_cached"],
+        )
 
     def test_cpp_engine_uses_file_list_when_available(self):
         from src.main import scanner_binary_path

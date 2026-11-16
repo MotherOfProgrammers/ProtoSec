@@ -220,9 +220,34 @@ FileResult analyzeFile(
     const auto filename = lower(file_path.filename().string());
     std::string masked_content;
     std::string_view analysis_content = content;
+    std::vector<TaintFlow> taint_flows;
     if (const auto language = sourceLanguageForPath(file_path)) {
-        masked_content = maskComments(content, findCommentByteRanges(content, *language));
+        auto syntax = analyzeSource(
+            content,
+            *language,
+            isRuleSelected(selected_rule_ids, "DATA-001")
+        );
+        masked_content = maskComments(content, syntax.comments);
+        taint_flows = std::move(syntax.taint_flows);
         analysis_content = masked_content;
+    }
+
+    for (const auto& flow : taint_flows) {
+        addFinding(
+            result.findings,
+            "DATA-001",
+            "Data Flow",
+            "HIGH",
+            flow.dynamic_code
+                ? "Untrusted input reaches dynamic code execution"
+                : "Untrusted input reaches a SQL execution sink",
+            relative_path,
+            lineAt(content, flow.sink_start_byte),
+            flow.sink + "(...)",
+            flow.dynamic_code
+                ? "Avoid eval/exec with untrusted input; replace it with fixed, validated operations."
+                : "Use parameterized SQL queries instead of concatenating untrusted input."
+        );
     }
 
     if (isRuleSelected(selected_rule_ids, "ENV-002") &&
@@ -447,6 +472,7 @@ ScanReport Scanner::runImpl(
     std::unordered_set<std::string> selected_rule_ids;
     const std::unordered_set<std::string> structural_rule_ids = {
         "ENV-002", "SEC-007", "DB-004", "API-001", "API-003", "AUTH-001",
+        "DATA-001",
     };
     if (rule_ids != nullptr) {
         std::unordered_set<std::string> known_rule_ids = structural_rule_ids;

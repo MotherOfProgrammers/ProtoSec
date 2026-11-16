@@ -20,7 +20,7 @@ struct Rule {
     std::string fix;
 };
 
-inline constexpr unsigned int kRuleEngineVersion = 1;
+inline constexpr unsigned int kRuleEngineVersion = 2;
 
 inline Rule makeRule(
     std::string id,

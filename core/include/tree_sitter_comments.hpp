@@ -20,8 +20,24 @@ struct CommentByteRange {
     std::size_t end_byte;
 };
 
+struct TaintFlow {
+    std::size_t sink_start_byte;
+    std::string sink;
+    bool dynamic_code;
+};
+
+struct TreeSitterAnalysis {
+    std::vector<CommentByteRange> comments;
+    std::vector<TaintFlow> taint_flows;
+};
+
 [[nodiscard]] std::optional<SourceLanguage> sourceLanguageForPath(
     const std::filesystem::path& path
+);
+[[nodiscard]] TreeSitterAnalysis analyzeSource(
+    std::string_view source,
+    SourceLanguage language,
+    bool analyze_taint
 );
 [[nodiscard]] std::vector<CommentByteRange> findCommentByteRanges(
     std::string_view source,
